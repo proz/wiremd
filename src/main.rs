@@ -3,7 +3,7 @@ use std::fs;
 use std::io::{self, stdout};
 
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
 };
@@ -16,9 +16,21 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
     Terminal,
 };
+use tui_textarea::{CursorMove, TextArea};
 
 const MAX_WIDTH: usize = 80;
 const CODE_MARGIN: usize = 4;
+
+enum Mode {
+    View,
+    Edit,
+}
+
+struct RenderResult {
+    lines: Vec<Line<'static>>,
+    /// Maps each rendered line index to a source line number (0-based)
+    source_map: Vec<usize>,
+}
 
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().collect();
@@ -33,73 +45,222 @@ fn main() -> io::Result<()> {
         std::process::exit(1);
     });
 
-    let lines = render_markdown(&content, MAX_WIDTH);
+    let mut mode = Mode::View;
+    let mut render = render_markdown(&content, MAX_WIDTH);
+    let mut scroll: u16 = 0;
+    let mut cursor_line: u16 = 0;
+    let mut modified = false;
+
+    let mut textarea = TextArea::from(content.lines());
+    textarea.set_block(
+        Block::default()
+            .title(format!(" {} [EDITING] ", path))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow)),
+    );
+    textarea.set_cursor_line_style(Style::default().bg(Color::Rgb(30, 30, 30)));
+    textarea.set_line_number_style(Style::default().fg(Color::DarkGray));
 
     enable_raw_mode()?;
     stdout().execute(EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
 
-    let mut scroll: u16 = 0;
-    let total_lines = lines.len() as u16;
-
     loop {
+        let total_lines = render.lines.len() as u16;
+
         terminal.draw(|frame| {
             let area = frame.area();
 
-            let chunks = Layout::horizontal([
-                Constraint::Min(0),
-                Constraint::Length(1),
-            ])
-            .split(area);
+            match mode {
+                Mode::View => {
+                    let chunks = Layout::horizontal([
+                        Constraint::Min(0),
+                        Constraint::Length(1),
+                    ])
+                    .split(area);
 
-            let visible_height = chunks[0].height.saturating_sub(2);
-            let max_scroll = total_lines.saturating_sub(visible_height);
+                    let visible_height = chunks[0].height.saturating_sub(2);
+                    let max_scroll = total_lines.saturating_sub(visible_height);
 
-            let block = Block::default()
-                .title(format!(" {} ", path))
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray));
+                    let title = if modified {
+                        format!(" {} [modified] ", path)
+                    } else {
+                        format!(" {} ", path)
+                    };
 
-            let paragraph = Paragraph::new(lines.clone())
-                .block(block)
-                .scroll((scroll, 0));
+                    // Highlight the cursor line
+                    let mut display_lines = render.lines.clone();
+                    let content_width = chunks[0].width.saturating_sub(2) as usize; // inside borders
+                    if (cursor_line as usize) < display_lines.len() {
+                        let idx = cursor_line as usize;
+                        let line = &display_lines[idx];
+                        let cursor_bg = Color::Rgb(40, 40, 55);
 
-            frame.render_widget(paragraph, chunks[0]);
+                        let mut highlighted: Vec<Span<'static>> = line
+                            .spans
+                            .iter()
+                            .map(|span| {
+                                Span::styled(
+                                    span.content.to_string(),
+                                    span.style.bg(cursor_bg),
+                                )
+                            })
+                            .collect();
 
-            let mut scrollbar_state =
-                ScrollbarState::new(max_scroll as usize).position(scroll as usize);
-            let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
-            frame.render_stateful_widget(scrollbar, chunks[1], &mut scrollbar_state);
+                        // Pad to full width so the highlight spans the entire line
+                        let text_len: usize = highlighted.iter().map(|s| s.content.len()).sum();
+                        if text_len < content_width {
+                            highlighted.push(Span::styled(
+                                " ".repeat(content_width - text_len),
+                                Style::default().bg(cursor_bg),
+                            ));
+                        }
+
+                        display_lines[idx] = Line::from(highlighted);
+                    }
+
+                    let block = Block::default()
+                        .title(title)
+                        .title_bottom(" e: edit │ q: quit │ s: save ")
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::DarkGray));
+
+                    let paragraph = Paragraph::new(display_lines)
+                        .block(block)
+                        .scroll((scroll, 0));
+
+                    frame.render_widget(paragraph, chunks[0]);
+
+                    let mut scrollbar_state =
+                        ScrollbarState::new(max_scroll as usize).position(scroll as usize);
+                    let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
+                    frame.render_stateful_widget(scrollbar, chunks[1], &mut scrollbar_state);
+                }
+                Mode::Edit => {
+                    frame.render_widget(&textarea, area);
+                }
+            }
         })?;
 
         if let Event::Key(key) = event::read()? {
             if key.kind != KeyEventKind::Press {
                 continue;
             }
-            let visible_height = terminal.size()?.height.saturating_sub(2);
-            let max_scroll = total_lines.saturating_sub(visible_height);
 
-            match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => break,
-                KeyCode::Down | KeyCode::Char('j') => {
-                    scroll = scroll.saturating_add(1).min(max_scroll);
+            match mode {
+                Mode::View => {
+                    let visible_height = terminal.size()?.height.saturating_sub(2);
+                    let max_scroll = total_lines.saturating_sub(visible_height);
+
+                    match key.code {
+                        KeyCode::Char('q') | KeyCode::Esc => break,
+                        KeyCode::Char('e') | KeyCode::Enter => {
+                            // Map cursor_line to source line via source_map
+                            let source_line = render
+                                .source_map
+                                .get(cursor_line as usize)
+                                .copied()
+                                .unwrap_or(0);
+
+                            // Move textarea cursor to the corresponding source line
+                            textarea.move_cursor(CursorMove::Jump(source_line as u16, 0));
+
+                            // Scroll textarea so the cursor appears at the same
+                            // screen row it was on in view mode.
+                            // Jump to the end first to force the viewport far down,
+                            // then to the top-of-screen line to anchor the viewport,
+                            // then to the actual cursor line.
+                            let screen_offset = cursor_line.saturating_sub(scroll) as usize;
+                            let top_source_line = source_line.saturating_sub(screen_offset);
+                            textarea.move_cursor(CursorMove::Bottom);
+                            textarea.move_cursor(CursorMove::Jump(top_source_line as u16, 0));
+                            textarea.move_cursor(CursorMove::Jump(source_line as u16, 0));
+
+                            mode = Mode::Edit;
+                        }
+                        KeyCode::Char('s') => {
+                            if modified {
+                                let text = textarea_content(&textarea);
+                                fs::write(path, &text)?;
+                                modified = false;
+                            }
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            if cursor_line < total_lines.saturating_sub(1) {
+                                cursor_line += 1;
+                                // Auto-scroll to keep cursor visible
+                                if cursor_line >= scroll + visible_height {
+                                    scroll = (cursor_line - visible_height + 1).min(max_scroll);
+                                }
+                            }
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            cursor_line = cursor_line.saturating_sub(1);
+                            if cursor_line < scroll {
+                                scroll = cursor_line;
+                            }
+                        }
+                        KeyCode::PageDown | KeyCode::Char(' ') => {
+                            cursor_line = (cursor_line + visible_height)
+                                .min(total_lines.saturating_sub(1));
+                            scroll = scroll.saturating_add(visible_height).min(max_scroll);
+                        }
+                        KeyCode::PageUp => {
+                            cursor_line = cursor_line.saturating_sub(visible_height);
+                            scroll = scroll.saturating_sub(visible_height);
+                        }
+                        KeyCode::Home | KeyCode::Char('g') => {
+                            cursor_line = 0;
+                            scroll = 0;
+                        }
+                        KeyCode::End | KeyCode::Char('G') => {
+                            cursor_line = total_lines.saturating_sub(1);
+                            scroll = max_scroll;
+                        }
+                        _ => {}
+                    }
                 }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    scroll = scroll.saturating_sub(1);
+                Mode::Edit => {
+                    if key.code == KeyCode::Esc {
+                        let text = textarea_content(&textarea);
+                        let editor_line = textarea.cursor().0;
+                        let visible_height = terminal.size()?.height.saturating_sub(2) as usize;
+                        render = render_markdown(&text, MAX_WIDTH);
+
+                        cursor_line = find_rendered_line(&render.source_map, editor_line);
+
+                        // Estimate where the cursor was on screen in the editor.
+                        // The textarea scrolls so the cursor is always visible,
+                        // so the cursor's screen row is at most visible_height-1.
+                        // Approximate: if editor_line > visible_height, cursor was
+                        // likely in the middle-ish of the screen.
+                        let screen_row = if editor_line < visible_height {
+                            editor_line
+                        } else {
+                            visible_height / 3
+                        };
+
+                        scroll = (cursor_line as usize).saturating_sub(screen_row) as u16;
+
+                        mode = Mode::View;
+                        continue;
+                    }
+
+                    if key.code == KeyCode::Char('s')
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        let text = textarea_content(&textarea);
+                        fs::write(path, &text)?;
+                        render = render_markdown(&text, MAX_WIDTH);
+                        modified = false;
+                        continue;
+                    }
+
+                    let event = Event::Key(key);
+                    if textarea.input(event) {
+                        modified = true;
+                    }
                 }
-                KeyCode::PageDown | KeyCode::Char(' ') => {
-                    scroll = scroll.saturating_add(visible_height).min(max_scroll);
-                }
-                KeyCode::PageUp => {
-                    scroll = scroll.saturating_sub(visible_height);
-                }
-                KeyCode::Home | KeyCode::Char('g') => {
-                    scroll = 0;
-                }
-                KeyCode::End | KeyCode::Char('G') => {
-                    scroll = max_scroll;
-                }
-                _ => {}
             }
         }
     }
@@ -109,15 +270,51 @@ fn main() -> io::Result<()> {
     Ok(())
 }
 
-fn render_markdown(input: &str, max_width: usize) -> Vec<Line<'static>> {
+/// Find the rendered line index that best matches a given source line number.
+fn find_rendered_line(source_map: &[usize], source_line: usize) -> u16 {
+    // Find first rendered line that maps to >= source_line
+    for (i, &src) in source_map.iter().enumerate() {
+        if src >= source_line {
+            return i as u16;
+        }
+    }
+    source_map.len().saturating_sub(1) as u16
+}
+
+fn textarea_content(textarea: &TextArea) -> String {
+    let lines = textarea.lines();
+    let mut text = lines.join("\n");
+    text.push('\n');
+    text
+}
+
+fn render_markdown(input: &str, max_width: usize) -> RenderResult {
     let options = Options::ENABLE_TABLES
         | Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_TASKLISTS;
-    let parser = Parser::new_ext(input, options);
-
     let code_width = max_width - CODE_MARGIN;
 
+    // Pre-compute byte offset → source line mapping
+    let byte_to_line = {
+        let mut map = Vec::new();
+        let mut line_num = 0usize;
+        for (i, ch) in input.char_indices() {
+            while map.len() <= i {
+                map.push(line_num);
+            }
+            if ch == '\n' {
+                line_num += 1;
+            }
+        }
+        // Pad to cover the full length
+        while map.len() <= input.len() {
+            map.push(line_num);
+        }
+        map
+    };
+
     let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut source_map: Vec<usize> = Vec::new();
     let mut current_spans: Vec<Span<'static>> = Vec::new();
     let mut style_stack: Vec<Style> = vec![Style::default()];
     let mut list_depth: usize = 0;
@@ -133,7 +330,21 @@ fn render_markdown(input: &str, max_width: usize) -> Vec<Line<'static>> {
     let mut current_cell = String::new();
     let mut in_cell = false;
 
-    for event in parser {
+    // Track the current source line based on parser offsets
+    let mut current_source_line: usize = 0;
+
+    // Use offset iter to track positions
+    let parser_with_offsets: Vec<_> = {
+        let parser = Parser::new_ext(input, options);
+        parser.into_offset_iter().collect()
+    };
+
+    for (event, range) in parser_with_offsets {
+        // Update current source line from the byte offset
+        if let Some(&line) = byte_to_line.get(range.start) {
+            current_source_line = line;
+        }
+
         match event {
             MdEvent::Start(tag) => match tag {
                 Tag::Heading { level, .. } => {
@@ -155,7 +366,7 @@ fn render_markdown(input: &str, max_width: usize) -> Vec<Line<'static>> {
                 Tag::CodeBlock(_) => {
                     in_code_block = true;
                     code_block_buf.clear();
-                    flush_line(&mut lines, &mut current_spans, max_width);
+                    flush_line(&mut lines, &mut source_map, &mut current_spans, max_width, current_source_line);
                 }
                 Tag::List(start) => {
                     list_depth += 1;
@@ -196,7 +407,7 @@ fn render_markdown(input: &str, max_width: usize) -> Vec<Line<'static>> {
                 Tag::Table(_alignments) => {
                     table_header.clear();
                     table_rows.clear();
-                    flush_line(&mut lines, &mut current_spans, max_width);
+                    flush_line(&mut lines, &mut source_map, &mut current_spans, max_width, current_source_line);
                 }
                 Tag::TableHead => {
                     is_header_row = true;
@@ -228,11 +439,14 @@ fn render_markdown(input: &str, max_width: usize) -> Vec<Line<'static>> {
                         heading_spans.push(Span::styled(span.content.to_string(), style));
                     }
                     lines.push(Line::from(heading_spans));
+                    source_map.push(current_source_line);
                     lines.push(Line::from(""));
+                    source_map.push(current_source_line);
                 }
                 TagEnd::Paragraph => {
-                    flush_line(&mut lines, &mut current_spans, max_width);
+                    flush_line(&mut lines, &mut source_map, &mut current_spans, max_width, current_source_line);
                     lines.push(Line::from(""));
+                    source_map.push(current_source_line);
                 }
                 TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough => {
                     style_stack.pop();
@@ -244,9 +458,9 @@ fn render_markdown(input: &str, max_width: usize) -> Vec<Line<'static>> {
                     let trimmed = code_block_buf.trim_end_matches('\n');
                     let inner_width = code_width;
 
-                    // Empty line with background for top padding
                     let top_pad = format!("{}{}", margin, " ".repeat(inner_width));
                     lines.push(Line::from(Span::styled(top_pad, block_style)));
+                    source_map.push(current_source_line);
 
                     for code_line in trimmed.split('\n') {
                         let visible_len = code_line.len();
@@ -257,33 +471,35 @@ fn render_markdown(input: &str, max_width: usize) -> Vec<Line<'static>> {
                         };
                         let padded = format!("{}{}", margin, content);
                         lines.push(Line::from(Span::styled(padded, block_style)));
+                        source_map.push(current_source_line);
+                        current_source_line += 1;
                     }
 
-                    // Empty line with background for bottom padding
                     let bot_pad = format!("{}{}", margin, " ".repeat(inner_width));
                     lines.push(Line::from(Span::styled(bot_pad, block_style)));
+                    source_map.push(current_source_line);
                     lines.push(Line::from(""));
+                    source_map.push(current_source_line);
                 }
                 TagEnd::List(_) => {
                     list_depth = list_depth.saturating_sub(1);
                     list_indices.pop();
                     if list_depth == 0 {
                         lines.push(Line::from(""));
+                        source_map.push(current_source_line);
                     }
                 }
                 TagEnd::Item => {
-                    flush_line(&mut lines, &mut current_spans, max_width);
+                    flush_line(&mut lines, &mut source_map, &mut current_spans, max_width, current_source_line);
                 }
                 TagEnd::BlockQuote(_) => {
                     style_stack.pop();
-                    flush_line(&mut lines, &mut current_spans, max_width);
+                    flush_line(&mut lines, &mut source_map, &mut current_spans, max_width, current_source_line);
                 }
                 TagEnd::Link => {
                     style_stack.pop();
                 }
                 TagEnd::Table => {
-
-                    // Compute column widths
                     let num_cols = table_header.len();
                     let mut col_widths: Vec<usize> = table_header.iter().map(|c| c.len()).collect();
                     for row in &table_rows {
@@ -300,14 +516,13 @@ fn render_markdown(input: &str, max_width: usize) -> Vec<Line<'static>> {
                         .add_modifier(Modifier::BOLD);
                     let cell_style = Style::default().fg(Color::White);
 
-                    // Top border
                     let top: Vec<String> = col_widths.iter().map(|w| "─".repeat(w + 2)).collect();
                     lines.push(Line::from(Span::styled(
                         format!("┌{}┐", top.join("┬")),
                         border_style,
                     )));
+                    source_map.push(current_source_line);
 
-                    // Header row
                     let mut header_spans: Vec<Span<'static>> = vec![
                         Span::styled("│", border_style),
                     ];
@@ -320,15 +535,15 @@ fn render_markdown(input: &str, max_width: usize) -> Vec<Line<'static>> {
                         header_spans.push(Span::styled("│", border_style));
                     }
                     lines.push(Line::from(header_spans));
+                    source_map.push(current_source_line);
 
-                    // Header separator
                     let sep: Vec<String> = col_widths.iter().map(|w| "═".repeat(w + 2)).collect();
                     lines.push(Line::from(Span::styled(
                         format!("╞{}╡", sep.join("╪")),
                         border_style,
                     )));
+                    source_map.push(current_source_line);
 
-                    // Data rows
                     for row in &table_rows {
                         let mut row_spans: Vec<Span<'static>> = vec![
                             Span::styled("│", border_style),
@@ -341,7 +556,6 @@ fn render_markdown(input: &str, max_width: usize) -> Vec<Line<'static>> {
                             ));
                             row_spans.push(Span::styled("│", border_style));
                         }
-                        // Pad missing cells
                         for i in row.len()..num_cols {
                             let w = col_widths.get(i).copied().unwrap_or(0);
                             row_spans.push(Span::styled(
@@ -351,15 +565,18 @@ fn render_markdown(input: &str, max_width: usize) -> Vec<Line<'static>> {
                             row_spans.push(Span::styled("│", border_style));
                         }
                         lines.push(Line::from(row_spans));
+                        source_map.push(current_source_line);
+                        current_source_line += 1;
                     }
 
-                    // Bottom border
                     let bot: Vec<String> = col_widths.iter().map(|w| "─".repeat(w + 2)).collect();
                     lines.push(Line::from(Span::styled(
                         format!("└{}┘", bot.join("┴")),
                         border_style,
                     )));
+                    source_map.push(current_source_line);
                     lines.push(Line::from(""));
+                    source_map.push(current_source_line);
                 }
                 TagEnd::TableHead => {
                     table_header = table_row.clone();
@@ -403,14 +620,16 @@ fn render_markdown(input: &str, max_width: usize) -> Vec<Line<'static>> {
                 }
             }
             MdEvent::HardBreak => {
-                flush_line(&mut lines, &mut current_spans, max_width);
+                flush_line(&mut lines, &mut source_map, &mut current_spans, max_width, current_source_line);
             }
             MdEvent::Rule => {
                 lines.push(Line::from(Span::styled(
                     "─".repeat(max_width),
                     Style::default().fg(Color::DarkGray),
                 )));
+                source_map.push(current_source_line);
                 lines.push(Line::from(""));
+                source_map.push(current_source_line);
             }
             MdEvent::TaskListMarker(checked) => {
                 let marker = if checked { "☑ " } else { "☐ " };
@@ -423,28 +642,33 @@ fn render_markdown(input: &str, max_width: usize) -> Vec<Line<'static>> {
         }
     }
 
-    flush_line(&mut lines, &mut current_spans, max_width);
-    lines
+    flush_line(&mut lines, &mut source_map, &mut current_spans, max_width, current_source_line);
+    RenderResult { lines, source_map }
 }
 
 fn current_style(stack: &[Style]) -> Style {
     stack.last().copied().unwrap_or_default()
 }
 
-fn flush_line(lines: &mut Vec<Line<'static>>, spans: &mut Vec<Span<'static>>, max_width: usize) {
+fn flush_line(
+    lines: &mut Vec<Line<'static>>,
+    source_map: &mut Vec<usize>,
+    spans: &mut Vec<Span<'static>>,
+    max_width: usize,
+    source_line: usize,
+) {
     if spans.is_empty() {
         return;
     }
 
-    // Calculate total text length
     let total_len: usize = spans.iter().map(|s| s.content.len()).sum();
 
     if total_len <= max_width {
         lines.push(Line::from(spans.drain(..).collect::<Vec<_>>()));
+        source_map.push(source_line);
         return;
     }
 
-    // Word-wrap: break spans across multiple lines
     let mut current_line: Vec<Span<'static>> = Vec::new();
     let mut current_len: usize = 0;
 
@@ -456,12 +680,11 @@ fn flush_line(lines: &mut Vec<Line<'static>>, spans: &mut Vec<Span<'static>>, ma
             let word_len = word.len();
 
             if current_len + word_len > max_width && current_len > 0 {
-                // Emit current line, start new one
                 lines.push(Line::from(
                     current_line.drain(..).collect::<Vec<_>>(),
                 ));
+                source_map.push(source_line);
                 current_len = 0;
-                // Skip leading space on new line
                 let trimmed = word.trim_start();
                 if !trimmed.is_empty() {
                     current_len = trimmed.len();
@@ -476,11 +699,10 @@ fn flush_line(lines: &mut Vec<Line<'static>>, spans: &mut Vec<Span<'static>>, ma
 
     if !current_line.is_empty() {
         lines.push(Line::from(current_line));
+        source_map.push(source_line);
     }
 }
 
-/// Splits text into chunks that keep words together with their trailing space.
-/// E.g., "hello world foo" -> ["hello ", "world ", "foo"]
 struct WordSplitter<'a> {
     remaining: &'a str,
 }
@@ -499,21 +721,17 @@ impl<'a> Iterator for WordSplitter<'a> {
             return None;
         }
 
-        // Find end of next word + trailing whitespace
         let bytes = self.remaining.as_bytes();
         let mut i = 0;
 
-        // Skip to end of non-space chars
         while i < bytes.len() && bytes[i] != b' ' {
             i += 1;
         }
-        // Include trailing spaces
         while i < bytes.len() && bytes[i] == b' ' {
             i += 1;
         }
 
         if i == 0 {
-            // All spaces
             let result = self.remaining;
             self.remaining = "";
             Some(result)
@@ -524,4 +742,3 @@ impl<'a> Iterator for WordSplitter<'a> {
         }
     }
 }
-

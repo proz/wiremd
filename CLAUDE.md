@@ -12,41 +12,47 @@ A terminal-native collaborative markdown editor using CRDTs for conflict-free sy
 ## Tech Stack
 
 - **Language**: Rust
-- **TUI**: `ratatui` + `crossterm`
-- **Text editing**: `tui-textarea`
-- **Markdown parsing**: `pulldown-cmark`
-- **Markdown rendering**: Custom renderer (pulldown-cmark events → ratatui Spans/Lines)
-- **CRDT engine**: `yrs` (y-crdt)
-- **Async runtime**: `tokio`
-- **Filesystem watching**: `notify`
-- **SSH transport**: `openssh` or shell out to `ssh`/`scp`
-- **Directory traversal**: `walkdir` + `ignore`
-- **Config/serialization**: `serde` + `toml`
+- **TUI**: `ratatui` 0.29 + `crossterm` 0.28
+- **Text editing**: `tui-textarea` 0.7
+- **Markdown parsing**: `pulldown-cmark` 0.13
+- **Markdown rendering**: Custom renderer (pulldown-cmark offset iter → ratatui Spans/Lines with source line mapping)
+- **CRDT engine**: `yrs` (y-crdt) — planned
+- **Async runtime**: `tokio` — planned
+- **Filesystem watching**: `notify` — planned
+- **SSH transport**: `openssh` or shell out to `ssh`/`scp` — planned
+- **Directory traversal**: `walkdir` + `ignore` — planned
+- **Config/serialization**: `serde` + `toml` — planned
 
-## Layout
+## Current State
 
-Three-pane TUI: file tree (left) | editor (center) | preview (right), with a status bar.
+### Working
+- Markdown viewer with rendered output (headings, code blocks, tables, lists, links, blockquotes, rules, task lists, inline code)
+- Word wrapping at configurable MAX_WIDTH (80)
+- Code blocks with uniform background and margin indentation
+- Tables with box-drawing borders, aligned columns, bold headers, empty cell support
+- View/edit toggle mode: rendered markdown view ↔ raw markdown editor
+- Source line mapping: cursor position preserved when switching between view and edit modes
+- Full-width cursor line highlight in view mode
+- Scrollbar, vim-style navigation (j/k, g/G, space, page up/down)
+- File save (Ctrl+S in edit, s in view)
+- Modified indicator in title bar
 
-## Server Filesystem Convention
+### Not Yet Implemented
+- Three-pane layout (file tree, editor, preview)
+- yrs CRDT integration
+- SSH sync
+- User presence
+- Config file support
 
-```
-/srv/docs/
-├── project-alpha/
-│   ├── README.md
-│   ├── notes.md
-│   └── .yrs/
-│       ├── README.bin          # full yrs doc state
-│       ├── notes.bin
-│       └── updates/            # append-only deltas
-│           ├── 001_alice_<ts>
-│           └── 002_bob_<ts>
-└── project-beta/
-    └── spec.md
-```
+## UI Modes
+
+- **View mode**: Rendered markdown with cursor line highlight. Navigate with j/k, edit with e/Enter, save with s, quit with q/Esc
+- **Edit mode**: Raw markdown in tui-textarea with line numbers. Save with Ctrl+S, return to view with Esc
 
 ## Development Guidelines
 
 - Keep dependencies minimal — don't add crates unless clearly needed
+- Pin ratatui to 0.29 to match tui-textarea 0.7 compatibility
 - Prefer simple shell-based SSH (scp/ssh commands) over Rust SSH libraries for the initial implementation
 - Test sync logic with two local yrs docs before involving SSH
 - Periodic compaction: merge pending updates into base state to avoid unbounded growth

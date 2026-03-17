@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-crossterm = "0.29.0"
-pulldown-cmark = "0.13.1"
-ratatui = "0.30.0"
+crossterm = "0.28"
+pulldown-cmark = "0.13"
+ratatui = "0.29"
+tui-textarea = "0.7"

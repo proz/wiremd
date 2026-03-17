@@ -10,13 +10,14 @@ A terminal-native collaborative markdown document editor. Users run a local TUI 
 
 ### F1 — TUI Interface
 
-- F1.1: Three-pane layout: file tree, editor, markdown preview
-- F1.2: File tree shows directory hierarchy from the configured document root
-- F1.3: Editor pane supports markdown editing with syntax highlighting
-- F1.4: Preview pane renders markdown in real-time as the user types
-- F1.5: Status bar shows: connection state, last sync time, current file, active users
-- F1.6: Keyboard-driven navigation between panes
-- F1.7: File tree indicates which files are being edited by other users
+- F1.1: ~~Three-pane layout: file tree, editor, markdown preview~~ → Single-pane with view/edit toggle (markdown is readable enough that a separate preview is unnecessary)
+- F1.2: File tree shows directory hierarchy from the configured document root (planned)
+- F1.3: Editor supports markdown editing via tui-textarea
+- F1.4: View mode renders markdown with styled output (headings, code blocks, tables, lists, etc.)
+- F1.5: Status bar shows: connection state, last sync time, current file, active users (planned)
+- F1.6: Keyboard-driven navigation with vim-style bindings
+- F1.7: Cursor line highlight in view mode, cursor position preserved across mode switches
+- F1.8: File tree indicates which files are being edited by other users (planned)
 
 ### F2 — Local Editing
 
@@ -60,7 +61,7 @@ A terminal-native collaborative markdown document editor. Users run a local TUI 
 ### NF1 — Performance
 
 - NF1.1: Editing must feel instant — no perceptible latency from CRDT operations
-- NF1.2: Markdown preview updates within 50ms of keystroke
+- NF1.2: Markdown re-render on mode switch must be imperceptible
 - NF1.3: Sync operations run in background, never block the UI
 - NF1.4: Handle documents up to 100K lines without degradation
 
@@ -117,3 +118,4 @@ name = "alice"
 - Git integration
 - Multi-cursor display within the editor pane
 - User access control beyond SSH permissions
+- Split view (editor + preview side by side)
