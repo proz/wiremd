@@ -1,4 +1,4 @@
-# Requirements — collab-tui
+# Requirements — wiremd
 
 ## Overview
 
@@ -87,7 +87,7 @@ A terminal-native collaborative markdown document editor. Users run a local TUI 
 ## Configuration
 
 ```toml
-# ~/.config/collab-tui/config.toml
+# ~/.config/wiremd/config.toml
 
 [server]
 host = "docs.example.com"
@@ -95,7 +95,7 @@ user = "alice"
 docs_path = "/srv/docs"
 
 [local]
-cache_dir = "~/.cache/collab-tui"
+cache_dir = "~/.cache/wiremd"
 sync_mode = "on-save"        # "manual" | "on-save" | "poll"
 poll_interval_secs = 10
 
