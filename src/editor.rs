@@ -1,9 +1,9 @@
 use std::io::{self, Stdout};
 use std::process::Child;
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::{
     prelude::CrosstermBackend,
     style::{Color, Modifier, Style},
@@ -86,6 +86,7 @@ pub struct Editor {
     _watcher_child: Option<Child>,
     user_name: String,
     online_users: Vec<String>,
+    last_save: Instant,
 }
 
 impl Editor {
@@ -199,15 +200,17 @@ impl Editor {
             _watcher_child: watcher_child,
             user_name,
             online_users,
+            last_save: Instant::now(),
         }
     }
 
     pub fn run(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
+        let autosave_interval = Duration::from_secs(3);
+
         loop {
             // Check for remote changes (pre-pulled by background thread)
             if let Some(ref rx) = self.watcher_rx {
                 let mut latest_state: Option<Vec<u8>> = None;
-                // Drain all pending — only use the latest
                 while let Ok(state) = rx.try_recv() {
                     latest_state = Some(state);
                 }
@@ -216,9 +219,13 @@ impl Editor {
                 }
             }
 
+            // Auto-save when modified and enough time has passed
+            if self.modified && self.last_save.elapsed() >= autosave_interval {
+                self.do_autosave();
+            }
+
             self.draw(terminal)?;
 
-            // Poll with timeout so we can check the watcher channel regularly
             if !event::poll(Duration::from_millis(200))? {
                 continue;
             }
@@ -234,6 +241,11 @@ impl Editor {
             }
         }
 
+        // Save on exit if modified
+        if self.modified {
+            self.do_autosave();
+        }
+
         // Clean up presence on exit
         if let Some(ref client) = self.sync_client {
             let _ = client.clear_presence(&self.relative_path, &self.user_name);
@@ -245,6 +257,83 @@ impl Editor {
         }
 
         Ok(())
+    }
+
+    /// Auto-save: sync to yrs, write locally (fast), push to server in background thread
+    fn do_autosave(&mut self) {
+        // 1. Sync textarea to yrs (in-memory, fast)
+        let local_content = textarea_content(&self.textarea);
+        sync_to_yrs(&self.text, &self.doc, &self.last_synced_content, &local_content);
+        self.last_synced_content = local_content.clone();
+
+        // Drain observer updates
+        {
+            let mut u = self.updates.lock().unwrap();
+            self.pending_updates.extend(u.drain(..));
+        }
+
+        // 2. Write locally (fast)
+        let _ = std::fs::write(&self.path, &local_content);
+
+        // 3. Push to server in background (non-blocking)
+        if let Some(ref client) = self.sync_client {
+            let state = {
+                let txn = self.doc.transact();
+                txn.encode_state_as_update_v1(&yrs::StateVector::default())
+            };
+
+            // Spawn background thread for SSH push
+            let host = client.host().to_string();
+            let ssh_user = client.ssh_user().to_string();
+            let port = client.port();
+            let docs_path = client.docs_path().to_string();
+            let relative_path = self.relative_path.clone();
+            let content = local_content.clone();
+
+            std::thread::spawn(move || {
+                // Push yrs state
+                let yrs_remote = format!(
+                    "{}@{}:{}/.wiremd/{}.yrs",
+                    ssh_user, host, docs_path, relative_path
+                );
+                let tmp_state = std::env::temp_dir().join("wiremd_autosave_state");
+                if std::fs::write(&tmp_state, &state).is_ok() {
+                    let _ = std::process::Command::new("scp")
+                        .arg("-P").arg(port.to_string())
+                        .arg("-o").arg("BatchMode=yes")
+                        .arg("-o").arg("ConnectTimeout=5")
+                        .arg(tmp_state.to_str().unwrap())
+                        .arg(&yrs_remote)
+                        .output();
+                    let _ = std::fs::remove_file(&tmp_state);
+                }
+
+                // Push markdown file
+                let file_remote = format!(
+                    "{}@{}:{}/{}",
+                    ssh_user, host, docs_path, relative_path
+                );
+                let tmp_file = std::env::temp_dir().join("wiremd_autosave_file");
+                if std::fs::write(&tmp_file, &content).is_ok() {
+                    let _ = std::process::Command::new("scp")
+                        .arg("-P").arg(port.to_string())
+                        .arg("-o").arg("BatchMode=yes")
+                        .arg("-o").arg("ConnectTimeout=5")
+                        .arg(tmp_file.to_str().unwrap())
+                        .arg(&file_remote)
+                        .output();
+                    let _ = std::fs::remove_file(&tmp_file);
+                }
+            });
+
+            self.sync_status = "saving...";
+        } else {
+            self.sync_status = "saved";
+        }
+
+        self.pending_updates.clear();
+        self.modified = false;
+        self.last_save = Instant::now();
     }
 
     /// Apply a pre-pulled remote state (no I/O, fast)
@@ -293,23 +382,6 @@ impl Editor {
                         );
                         self.mode = Mode::Edit;
                     }
-                    KeyCode::Char('s') => {
-                        if self.modified {
-                            match self.save_and_sync() {
-                                Ok(Some(merged)) => {
-                                    self.reload_textarea(&merged);
-                                    self.sync_status = "merged";
-                                }
-                                Ok(None) => {
-                                    self.sync_status = if self.sync_client.is_some() { "synced" } else { "saved" };
-                                }
-                                Err(_) => {
-                                    self.sync_status = "sync error";
-                                }
-                            }
-                            self.modified = false;
-                        }
-                    }
                     KeyCode::Down | KeyCode::Char('j') => {
                         if self.view_cursor < total_display_lines.saturating_sub(1) {
                             self.view_cursor += 1;
@@ -340,29 +412,6 @@ impl Editor {
                     let (dr, _) = display.source_to_display(row, col);
                     self.view_cursor = dr;
                     self.mode = Mode::View;
-                    return Ok(false);
-                }
-
-                if key.code == KeyCode::Char('s')
-                    && key.modifiers.contains(KeyModifiers::CONTROL)
-                {
-                    match self.save_and_sync() {
-                        Ok(Some(merged)) => {
-                            let cursor_pos = self.textarea.cursor();
-                            self.reload_textarea(&merged);
-                            self.textarea.move_cursor(tui_textarea::CursorMove::Jump(
-                                cursor_pos.0 as u16, cursor_pos.1 as u16,
-                            ));
-                            self.sync_status = "merged";
-                        }
-                        Ok(None) => {
-                            self.sync_status = if self.sync_client.is_some() { "synced" } else { "saved" };
-                        }
-                        Err(_) => {
-                            self.sync_status = "sync error";
-                        }
-                    }
-                    self.modified = false;
                     return Ok(false);
                 }
 
@@ -425,8 +474,8 @@ impl Editor {
                 };
 
                 let bottom = match self.mode {
-                    Mode::View => " e: edit │ q: quit │ s: save ",
-                    Mode::Edit => " Esc: view │ Ctrl+S: save ",
+                    Mode::View => " e: edit │ q: quit ",
+                    Mode::Edit => " Esc: view │ auto-saving ",
                 };
 
                 let block = Block::default()
@@ -525,72 +574,6 @@ impl Editor {
         self.last_synced_content = textarea_content(&self.textarea);
     }
 
-    fn save_and_sync(&mut self) -> Result<Option<String>, String> {
-        // Sync local edits to yrs (raw content, no unreflow)
-        let local_content = textarea_content(&self.textarea);
-        sync_to_yrs(&self.text, &self.doc, &self.last_synced_content, &local_content);
-        self.last_synced_content = local_content.clone();
-
-        // Drain observer updates
-        {
-            let mut u = self.updates.lock().unwrap();
-            self.pending_updates.extend(u.drain(..));
-        }
-
-        if let Some(ref client) = self.sync_client {
-            // 1. Pull remote yrs state snapshot
-            if let Ok(Some(remote_state)) = client.pull_state(&self.relative_path) {
-                // 2. Merge remote state into local doc (CRDT auto-merge)
-                if let Ok(update) = yrs::Update::decode_v1(&remote_state) {
-                    let mut txn = self.doc.transact_mut();
-                    let _ = txn.apply_update(update);
-                }
-            }
-
-            // 3. Get merged content from yrs doc
-            let merged = {
-                let txn = self.doc.transact();
-                self.text.get_string(&txn)
-            };
-
-            // 4. Write merged text locally
-            std::fs::write(&self.path, &merged)
-                .map_err(|e| format!("Failed to write file: {}", e))?;
-
-            // 5. Push our full yrs state to server (snapshot)
-            let state = {
-                let txn = self.doc.transact();
-                txn.encode_state_as_update_v1(&yrs::StateVector::default())
-            };
-            client.push_state(&self.relative_path, &state)
-                .map_err(|e| format!("Push state failed: {}", e))?;
-
-            // 6. Push merged markdown file to server
-            client.push_file(&self.relative_path, &merged)
-                .map_err(|e| format!("Push file failed: {}", e))?;
-
-            self.pending_updates.clear();
-
-            // Compare merged content with what we had locally
-            let changed = merged != local_content;
-
-            if changed {
-                // After reload_textarea, last_synced_content must match textarea_content()
-                // We'll set it in the caller after reload
-                self.last_synced_content = merged.clone();
-                Ok(Some(merged))
-            } else {
-                self.last_synced_content = local_content;
-                Ok(None)
-            }
-        } else {
-            // Offline: just save locally
-            std::fs::write(&self.path, &local_content)
-                .map_err(|e| format!("Failed to write file: {}", e))?;
-            self.pending_updates.clear();
-            Ok(None)
-        }
-    }
 }
 
 /// Reflow: wrap long paragraph lines at max_width for editing.

@@ -243,6 +243,14 @@ impl SyncClient {
         &self.host
     }
 
+    pub fn ssh_user(&self) -> &str {
+        &self.ssh_user
+    }
+
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
     /// Start watching a remote .yrs file for changes via inotifywait.
     /// The background thread detects changes AND pulls the state,
     /// sending the pulled bytes through the channel so the main thread
