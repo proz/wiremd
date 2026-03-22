@@ -104,10 +104,12 @@ impl Editor {
 
             if let Ok(Some(remote_state)) = client.pull_state(&relative_path) {
                 if let Ok(update) = yrs::Update::decode_v1(&remote_state) {
-                    let mut txn = doc.transact_mut();
-                    let _ = txn.apply_update(update);
-                    let txn2 = doc.transact();
-                    let remote_content = text.get_string(&txn2);
+                    {
+                        let mut txn = doc.transact_mut();
+                        let _ = txn.apply_update(update);
+                    } // drop write txn before reading
+                    let txn = doc.transact();
+                    let remote_content = text.get_string(&txn);
                     if !remote_content.is_empty() {
                         initial_content = remote_content;
                         sync_status = "synced";
