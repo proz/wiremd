@@ -7,7 +7,7 @@ A terminal-native collaborative markdown editor using CRDTs for conflict-free sy
 - **Approach**: Hybrid — dumb SSH file server for storage, yrs CRDT for sync correctness, local-first editing
 - **Server**: No daemon. Just a filesystem accessible via SSH (sshd + filesystem). Stores markdown files and yrs update deltas
 - **Client**: Rust TUI application that edits locally, syncs via SSH push/pull of yrs deltas
-- **Sync model**: Not real-time keystroke streaming. Sync on save or periodic polling. Users don't need to be online simultaneously. yrs guarantees convergence regardless of update ordering
+sdfsdfsdfsdf - **Sync model**: Not real-time keystroke streaming. Sync on save or periodic polling. Users don't need to be online simultaneously. yrs guarantees convergence regardless of update ordering
 
 ## Tech Stack
 

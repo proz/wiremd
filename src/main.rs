@@ -1,3 +1,6 @@
+mod config;
+mod sync;
+
 use std::env;
 use std::fs;
 use std::io::{self, stdout};
@@ -7,35 +10,84 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
 };
-use pulldown_cmark::{Event as MdEvent, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::{
-    layout::{Constraint, Layout},
     prelude::CrosstermBackend,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
+    widgets::{Block, Borders, Paragraph},
     Terminal,
 };
-use tui_textarea::{CursorMove, TextArea};
+use similar::{ChangeTag, TextDiff};
+use tui_textarea::TextArea;
+use yrs::{Doc, Text, TextRef, Transact};
 
 const MAX_WIDTH: usize = 80;
-const CODE_MARGIN: usize = 4;
 
 enum Mode {
     View,
     Edit,
 }
 
-struct RenderResult {
+/// Maps display lines back to source positions
+struct DisplayMap {
     lines: Vec<Line<'static>>,
-    /// Maps each rendered line index to a source line number (0-based)
-    source_map: Vec<usize>,
+    /// For each display line: (source_line_index, col_offset_within_source)
+    map: Vec<(usize, usize)>,
+}
+
+impl DisplayMap {
+    /// Find display line index for a given source (row, col)
+    fn source_to_display(&self, src_row: usize, src_col: usize) -> (usize, usize) {
+        let mut best_display_row = 0;
+        for (i, &(sline, scol)) in self.map.iter().enumerate() {
+            if sline == src_row {
+                // Check if this display line contains our column
+                let next_col = self
+                    .map
+                    .get(i + 1)
+                    .filter(|&&(nl, _)| nl == src_row)
+                    .map(|&(_, nc)| nc)
+                    .unwrap_or(usize::MAX);
+                if src_col >= scol && src_col < next_col {
+                    return (i, src_col - scol);
+                }
+                best_display_row = i;
+            } else if sline > src_row {
+                break;
+            }
+        }
+        // Fallback: last display line for this source line
+        (best_display_row, src_col.saturating_sub(self.map.get(best_display_row).map(|m| m.1).unwrap_or(0)))
+    }
+
+    /// Find source line for a given display line index
+    fn display_to_source(&self, display_row: usize) -> usize {
+        self.map.get(display_row).map(|m| m.0).unwrap_or(0)
+    }
+
+    fn len(&self) -> usize {
+        self.lines.len()
+    }
 }
 
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().collect();
+
+    // Handle --init flag
+    if args.get(1).map(|s| s.as_str()) == Some("--init") {
+        match config::Config::init() {
+            Ok(path) => {
+                eprintln!("Config created at {}", path.display());
+                eprintln!("Edit it to set your server details.");
+            }
+            Err(e) => eprintln!("Error: {}", e),
+        }
+        return Ok(());
+    }
+
     if args.len() < 2 {
         eprintln!("Usage: wiremd <file.md>");
+        eprintln!("       wiremd --init    Create config file");
         std::process::exit(1);
     }
 
@@ -45,99 +97,181 @@ fn main() -> io::Result<()> {
         std::process::exit(1);
     });
 
+    // Load config and set up sync client (optional — works offline too)
+    let sync_client = match config::Config::load() {
+        Ok(cfg) => {
+            let client = sync::SyncClient::new(&cfg);
+            match client.test_connection() {
+                Ok(_) => Some(client),
+                Err(e) => {
+                    eprintln!("Warning: server not reachable ({}). Working offline.", e);
+                    None
+                }
+            }
+        }
+        Err(_) => None,
+    };
+    let mut sync_status = if sync_client.is_some() {
+        "connected"
+    } else {
+        "offline"
+    };
+
     let mut mode = Mode::View;
-    let mut render = render_markdown(&content, MAX_WIDTH);
-    let mut scroll: u16 = 0;
-    let mut cursor_line: u16 = 0;
+    let mut scroll: usize = 0;
+    let mut view_cursor: usize = 0;
     let mut modified = false;
 
-    let mut textarea = TextArea::from(content.lines());
-    textarea.set_block(
-        Block::default()
-            .title(format!(" {} [EDITING] ", path))
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Yellow)),
-    );
-    textarea.set_cursor_line_style(Style::default().bg(Color::Rgb(30, 30, 30)));
-    textarea.set_line_number_style(Style::default().fg(Color::DarkGray));
+    // Reflow content: wrap long paragraph lines for comfortable editing
+    let reflowed = reflow(&content, MAX_WIDTH);
+    let mut textarea = TextArea::from(reflowed.lines());
+    textarea.set_cursor_line_style(Style::default());
+    textarea.set_cursor_style(Style::default());
+
+    // Initialize yrs document with the file content
+    let doc = Doc::new();
+    let text = doc.get_or_insert_text("content");
+    {
+        let mut txn = doc.transact_mut();
+        text.insert(&mut txn, 0, &content);
+    }
+    let mut last_synced_content = content.clone();
+    let mut pending_updates: Vec<Vec<u8>> = Vec::new();
+
+    // Subscribe to doc updates to capture deltas
+    let updates = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+    let updates_clone = updates.clone();
+    let _sub = doc.observe_update_v1(move |_txn, event| {
+        updates_clone.lock().unwrap().push(event.update.clone());
+    });
+
+    // Derive relative path for remote sync (filename only for now)
+    let relative_path = std::path::Path::new(path)
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or(path)
+        .to_string();
+
+    // Initial pull from server
+    if let Some(ref client) = sync_client {
+        let _ = client.ensure_remote_dirs(&relative_path);
+        // TODO: pull remote state and updates, merge into local doc
+    }
 
     enable_raw_mode()?;
     stdout().execute(EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
 
     loop {
-        let total_lines = render.lines.len() as u16;
-
         terminal.draw(|frame| {
             let area = frame.area();
+            let lines = textarea.lines();
 
-            match mode {
+            let updates_count = pending_updates.len();
+            let sync_info = if updates_count > 0 {
+                format!(" [{}|{} pending]", sync_status, updates_count)
+            } else {
+                format!(" [{}]", sync_status)
+            };
+
+            let title = match mode {
                 Mode::View => {
-                    let chunks = Layout::horizontal([
-                        Constraint::Min(0),
-                        Constraint::Length(1),
-                    ])
-                    .split(area);
-
-                    let visible_height = chunks[0].height.saturating_sub(2);
-                    let max_scroll = total_lines.saturating_sub(visible_height);
-
-                    let title = if modified {
-                        format!(" {} [modified] ", path)
+                    if modified {
+                        format!(" {} [modified]{} ", path, sync_info)
                     } else {
-                        format!(" {} ", path)
-                    };
-
-                    // Highlight the cursor line
-                    let mut display_lines = render.lines.clone();
-                    let content_width = chunks[0].width.saturating_sub(2) as usize; // inside borders
-                    if (cursor_line as usize) < display_lines.len() {
-                        let idx = cursor_line as usize;
-                        let line = &display_lines[idx];
-                        let cursor_bg = Color::Rgb(40, 40, 55);
-
-                        let mut highlighted: Vec<Span<'static>> = line
-                            .spans
-                            .iter()
-                            .map(|span| {
-                                Span::styled(
-                                    span.content.to_string(),
-                                    span.style.bg(cursor_bg),
-                                )
-                            })
-                            .collect();
-
-                        // Pad to full width so the highlight spans the entire line
-                        let text_len: usize = highlighted.iter().map(|s| s.content.len()).sum();
-                        if text_len < content_width {
-                            highlighted.push(Span::styled(
-                                " ".repeat(content_width - text_len),
-                                Style::default().bg(cursor_bg),
-                            ));
-                        }
-
-                        display_lines[idx] = Line::from(highlighted);
+                        format!(" {}{} ", path, sync_info)
                     }
-
-                    let block = Block::default()
-                        .title(title)
-                        .title_bottom(" e: edit │ q: quit │ s: save ")
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(Color::DarkGray));
-
-                    let paragraph = Paragraph::new(display_lines)
-                        .block(block)
-                        .scroll((scroll, 0));
-
-                    frame.render_widget(paragraph, chunks[0]);
-
-                    let mut scrollbar_state =
-                        ScrollbarState::new(max_scroll as usize).position(scroll as usize);
-                    let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
-                    frame.render_stateful_widget(scrollbar, chunks[1], &mut scrollbar_state);
                 }
                 Mode::Edit => {
-                    frame.render_widget(&textarea, area);
+                    if modified {
+                        format!(" {} [editing] [modified]{} ", path, sync_info)
+                    } else {
+                        format!(" {} [editing]{} ", path, sync_info)
+                    }
+                }
+            };
+
+            let bottom = match mode {
+                Mode::View => " e: edit │ q: quit │ s: save ",
+                Mode::Edit => " Esc: view │ Ctrl+S: save ",
+            };
+
+            let block = Block::default()
+                .title(title)
+                .title_bottom(bottom)
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray));
+
+            let inner = block.inner(area);
+            let visible_height = inner.height as usize;
+
+            // Highlight and wrap all lines
+            let display = highlight_and_wrap(lines, MAX_WIDTH);
+
+            // Determine cursor display position
+            let (display_cursor_line, display_cursor_col) = match mode {
+                Mode::View => (view_cursor, None),
+                Mode::Edit => {
+                    let (row, col) = textarea.cursor();
+                    let (dr, dc) = display.source_to_display(row, col);
+                    (dr, Some(dc))
+                }
+            };
+
+            // Auto-scroll to keep cursor visible
+            if display_cursor_line < scroll {
+                scroll = display_cursor_line;
+            }
+            if display_cursor_line >= scroll + visible_height {
+                scroll = display_cursor_line - visible_height + 1;
+            }
+
+            // Build visible lines with cursor highlight
+            let mut display_lines: Vec<Line> = Vec::new();
+            let content_width = inner.width as usize;
+
+            for (i, line) in display.lines.iter().enumerate().skip(scroll).take(visible_height) {
+                if i == display_cursor_line {
+                    let cursor_bg = Color::Rgb(40, 40, 55);
+                    let mut spans: Vec<Span<'static>> = line
+                        .spans
+                        .iter()
+                        .map(|span| {
+                            Span::styled(
+                                span.content.to_string(),
+                                span.style.bg(cursor_bg),
+                            )
+                        })
+                        .collect();
+
+                    let text_len: usize = spans.iter().map(|s| s.content.len()).sum();
+                    if text_len < content_width {
+                        spans.push(Span::styled(
+                            " ".repeat(content_width - text_len),
+                            Style::default().bg(cursor_bg),
+                        ));
+                    }
+
+                    display_lines.push(Line::from(spans));
+                } else {
+                    display_lines.push(line.clone());
+                }
+            }
+
+            frame.render_widget(block, area);
+            let paragraph = Paragraph::new(display_lines);
+            frame.render_widget(paragraph, inner);
+
+            // Draw text cursor in edit mode
+            if let Some(col) = display_cursor_col {
+                let screen_row = display_cursor_line.saturating_sub(scroll) as u16;
+                let screen_col = col as u16;
+                if screen_row < inner.height && screen_col < inner.width {
+                    let cx = inner.x + screen_col;
+                    let cy = inner.y + screen_row;
+                    if let Some(cell) = frame.buffer_mut().cell_mut((cx, cy)) {
+                        cell.set_style(Style::default().add_modifier(Modifier::REVERSED));
+                    }
                 }
             }
         })?;
@@ -147,101 +281,66 @@ fn main() -> io::Result<()> {
                 continue;
             }
 
+            let display = highlight_and_wrap(textarea.lines(), MAX_WIDTH);
+            let total_display_lines = display.len();
+            let visible_height = terminal.size()?.height.saturating_sub(2) as usize;
+
             match mode {
                 Mode::View => {
-                    let visible_height = terminal.size()?.height.saturating_sub(2);
-                    let max_scroll = total_lines.saturating_sub(visible_height);
-
                     match key.code {
                         KeyCode::Char('q') | KeyCode::Esc => break,
                         KeyCode::Char('e') | KeyCode::Enter => {
-                            // Map cursor_line to source line via source_map
-                            let source_line = render
-                                .source_map
-                                .get(cursor_line as usize)
-                                .copied()
-                                .unwrap_or(0);
-
-                            // Move textarea cursor to the corresponding source line
-                            textarea.move_cursor(CursorMove::Jump(source_line as u16, 0));
-
-                            // Scroll textarea so the cursor appears at the same
-                            // screen row it was on in view mode.
-                            // Jump to the end first to force the viewport far down,
-                            // then to the top-of-screen line to anchor the viewport,
-                            // then to the actual cursor line.
-                            let screen_offset = cursor_line.saturating_sub(scroll) as usize;
-                            let top_source_line = source_line.saturating_sub(screen_offset);
-                            textarea.move_cursor(CursorMove::Bottom);
-                            textarea.move_cursor(CursorMove::Jump(top_source_line as u16, 0));
-                            textarea.move_cursor(CursorMove::Jump(source_line as u16, 0));
-
+                            let src_line = display.display_to_source(view_cursor);
+                            textarea.move_cursor(tui_textarea::CursorMove::Jump(
+                                src_line as u16,
+                                0,
+                            ));
                             mode = Mode::Edit;
                         }
                         KeyCode::Char('s') => {
                             if modified {
                                 let text = textarea_content(&textarea);
-                                fs::write(path, &text)?;
+                                let save_text = unreflow(&text);
+                                fs::write(path, &save_text)?;
+                                // Push to server
+                                if let Some(ref client) = sync_client {
+                                    let _ = client.push_updates(&relative_path, &pending_updates);
+                                    let _ = client.push_file(&relative_path, &save_text);
+                                    pending_updates.clear();
+                                    sync_status = "synced";
+                                }
                                 modified = false;
                             }
                         }
                         KeyCode::Down | KeyCode::Char('j') => {
-                            if cursor_line < total_lines.saturating_sub(1) {
-                                cursor_line += 1;
-                                // Auto-scroll to keep cursor visible
-                                if cursor_line >= scroll + visible_height {
-                                    scroll = (cursor_line - visible_height + 1).min(max_scroll);
-                                }
+                            if view_cursor < total_display_lines.saturating_sub(1) {
+                                view_cursor += 1;
                             }
                         }
                         KeyCode::Up | KeyCode::Char('k') => {
-                            cursor_line = cursor_line.saturating_sub(1);
-                            if cursor_line < scroll {
-                                scroll = cursor_line;
-                            }
+                            view_cursor = view_cursor.saturating_sub(1);
                         }
                         KeyCode::PageDown | KeyCode::Char(' ') => {
-                            cursor_line = (cursor_line + visible_height)
-                                .min(total_lines.saturating_sub(1));
-                            scroll = scroll.saturating_add(visible_height).min(max_scroll);
+                            view_cursor = (view_cursor + visible_height)
+                                .min(total_display_lines.saturating_sub(1));
                         }
                         KeyCode::PageUp => {
-                            cursor_line = cursor_line.saturating_sub(visible_height);
-                            scroll = scroll.saturating_sub(visible_height);
+                            view_cursor = view_cursor.saturating_sub(visible_height);
                         }
                         KeyCode::Home | KeyCode::Char('g') => {
-                            cursor_line = 0;
-                            scroll = 0;
+                            view_cursor = 0;
                         }
                         KeyCode::End | KeyCode::Char('G') => {
-                            cursor_line = total_lines.saturating_sub(1);
-                            scroll = max_scroll;
+                            view_cursor = total_display_lines.saturating_sub(1);
                         }
                         _ => {}
                     }
                 }
                 Mode::Edit => {
                     if key.code == KeyCode::Esc {
-                        let text = textarea_content(&textarea);
-                        let editor_line = textarea.cursor().0;
-                        let visible_height = terminal.size()?.height.saturating_sub(2) as usize;
-                        render = render_markdown(&text, MAX_WIDTH);
-
-                        cursor_line = find_rendered_line(&render.source_map, editor_line);
-
-                        // Estimate where the cursor was on screen in the editor.
-                        // The textarea scrolls so the cursor is always visible,
-                        // so the cursor's screen row is at most visible_height-1.
-                        // Approximate: if editor_line > visible_height, cursor was
-                        // likely in the middle-ish of the screen.
-                        let screen_row = if editor_line < visible_height {
-                            editor_line
-                        } else {
-                            visible_height / 3
-                        };
-
-                        scroll = (cursor_line as usize).saturating_sub(screen_row) as u16;
-
+                        let (row, col) = textarea.cursor();
+                        let (dr, _) = display.source_to_display(row, col);
+                        view_cursor = dr;
                         mode = Mode::View;
                         continue;
                     }
@@ -250,8 +349,15 @@ fn main() -> io::Result<()> {
                         && key.modifiers.contains(KeyModifiers::CONTROL)
                     {
                         let text = textarea_content(&textarea);
-                        fs::write(path, &text)?;
-                        render = render_markdown(&text, MAX_WIDTH);
+                        let save_text = unreflow(&text);
+                        fs::write(path, &save_text)?;
+                        // Push to server
+                        if let Some(ref client) = sync_client {
+                            let _ = client.push_updates(&relative_path, &pending_updates);
+                            let _ = client.push_file(&relative_path, &save_text);
+                            pending_updates.clear();
+                            sync_status = "synced";
+                        }
                         modified = false;
                         continue;
                     }
@@ -259,6 +365,15 @@ fn main() -> io::Result<()> {
                     let event = Event::Key(key);
                     if textarea.input(event) {
                         modified = true;
+
+                        // Sync textarea content to yrs doc
+                        let current = unreflow(&textarea_content(&textarea));
+                        sync_to_yrs(&text, &doc, &last_synced_content, &current);
+                        last_synced_content = current;
+
+                        // Collect any pending updates
+                        let mut u = updates.lock().unwrap();
+                        pending_updates.extend(u.drain(..));
                     }
                 }
             }
@@ -270,15 +385,196 @@ fn main() -> io::Result<()> {
     Ok(())
 }
 
-/// Find the rendered line index that best matches a given source line number.
-fn find_rendered_line(source_map: &[usize], source_line: usize) -> u16 {
-    // Find first rendered line that maps to >= source_line
-    for (i, &src) in source_map.iter().enumerate() {
-        if src >= source_line {
-            return i as u16;
+/// Reflow: wrap long paragraph lines at max_width for editing.
+/// Block-level elements (headings, lists, code, tables, blank lines) are left as-is.
+fn reflow(input: &str, max_width: usize) -> String {
+    let mut result = String::new();
+    let mut in_code_block = false;
+
+    for line in input.lines() {
+        if line.starts_with("```") {
+            in_code_block = !in_code_block;
+            result.push_str(line);
+            result.push('\n');
+            continue;
+        }
+
+        // Don't wrap: code blocks, block elements, short lines
+        if in_code_block || is_block_element(line) || line.len() <= max_width {
+            result.push_str(line);
+            result.push('\n');
+            continue;
+        }
+
+        // Wrap long paragraph line at word boundaries
+        let mut pos = 0;
+        let bytes = line.as_bytes();
+        while pos < bytes.len() {
+            if bytes.len() - pos <= max_width {
+                result.push_str(&line[pos..]);
+                result.push('\n');
+                break;
+            }
+
+            // Find last space before max_width
+            let end = pos + max_width;
+            let mut break_at = end;
+            for i in (pos..end).rev() {
+                if bytes[i] == b' ' {
+                    break_at = i;
+                    break;
+                }
+            }
+
+            // No space found — force break at max_width
+            if break_at == end && break_at < bytes.len() {
+                result.push_str(&line[pos..break_at]);
+                result.push('\n');
+                pos = break_at;
+            } else {
+                result.push_str(&line[pos..break_at]);
+                result.push('\n');
+                pos = break_at + 1; // skip the space
+            }
         }
     }
-    source_map.len().saturating_sub(1) as u16
+
+    result
+}
+
+/// Unreflow: join consecutive plain paragraph lines back into single lines.
+/// Block elements and blank lines act as paragraph separators.
+fn unreflow(input: &str) -> String {
+    let mut result = String::new();
+    let mut paragraph = String::new();
+    let mut in_code_block = false;
+
+    for line in input.lines() {
+        if line.starts_with("```") {
+            // Flush any accumulated paragraph
+            if !paragraph.is_empty() {
+                result.push_str(paragraph.trim_end());
+                result.push('\n');
+                paragraph.clear();
+            }
+            in_code_block = !in_code_block;
+            result.push_str(line);
+            result.push('\n');
+            continue;
+        }
+
+        if in_code_block {
+            result.push_str(line);
+            result.push('\n');
+            continue;
+        }
+
+        if line.is_empty() {
+            // Blank line: flush paragraph, emit blank line
+            if !paragraph.is_empty() {
+                result.push_str(paragraph.trim_end());
+                result.push('\n');
+                paragraph.clear();
+            }
+            result.push('\n');
+            continue;
+        }
+
+        if is_block_element(line) {
+            // Block element: flush paragraph, emit the line as-is
+            if !paragraph.is_empty() {
+                result.push_str(paragraph.trim_end());
+                result.push('\n');
+                paragraph.clear();
+            }
+            result.push_str(line);
+            result.push('\n');
+            continue;
+        }
+
+        // Plain text: accumulate into paragraph
+        if paragraph.is_empty() {
+            paragraph.push_str(line);
+        } else {
+            paragraph.push(' ');
+            paragraph.push_str(line);
+        }
+    }
+
+    // Flush remaining paragraph
+    if !paragraph.is_empty() {
+        result.push_str(paragraph.trim_end());
+        result.push('\n');
+    }
+
+    result
+}
+
+/// Check if a line is a markdown block element (should not be joined with adjacent lines).
+fn is_block_element(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    if trimmed.is_empty() {
+        return true;
+    }
+    // Headings
+    if trimmed.starts_with('#') && trimmed.contains("# ") {
+        return true;
+    }
+    // Lists
+    if trimmed.starts_with("- ") || trimmed.starts_with("* ") || trimmed.starts_with("+ ") {
+        return true;
+    }
+    // Ordered lists
+    if let Some(dot_pos) = trimmed.find(". ") {
+        if trimmed[..dot_pos].chars().all(|c| c.is_ascii_digit()) && dot_pos > 0 {
+            return true;
+        }
+    }
+    // Block quotes
+    if trimmed.starts_with('>') {
+        return true;
+    }
+    // Tables
+    if trimmed.starts_with('|') {
+        return true;
+    }
+    // Horizontal rules
+    if trimmed == "---" || trimmed == "***" || trimmed == "___" {
+        return true;
+    }
+    // Code fences
+    if trimmed.starts_with("```") {
+        return true;
+    }
+    false
+}
+
+/// Diff old vs new content and apply the changes to the yrs Text type.
+fn sync_to_yrs(text: &TextRef, doc: &Doc, old: &str, new: &str) {
+    if old == new {
+        return;
+    }
+
+    let diff = TextDiff::from_chars(old, new);
+    let mut txn = doc.transact_mut();
+    let mut pos: u32 = 0;
+
+    for change in diff.iter_all_changes() {
+        match change.tag() {
+            ChangeTag::Equal => {
+                pos += change.value().len() as u32;
+            }
+            ChangeTag::Delete => {
+                let len = change.value().len() as u32;
+                text.remove_range(&mut txn, pos, len);
+            }
+            ChangeTag::Insert => {
+                let value = change.value();
+                text.insert(&mut txn, pos, value);
+                pos += value.len() as u32;
+            }
+        }
+    }
 }
 
 fn textarea_content(textarea: &TextArea) -> String {
@@ -288,391 +584,124 @@ fn textarea_content(textarea: &TextArea) -> String {
     text
 }
 
-fn render_markdown(input: &str, max_width: usize) -> RenderResult {
-    let options = Options::ENABLE_TABLES
-        | Options::ENABLE_STRIKETHROUGH
-        | Options::ENABLE_TASKLISTS;
-    let code_width = max_width - CODE_MARGIN;
-
-    // Pre-compute byte offset → source line mapping
-    let byte_to_line = {
-        let mut map = Vec::new();
-        let mut line_num = 0usize;
-        for (i, ch) in input.char_indices() {
-            while map.len() <= i {
-                map.push(line_num);
-            }
-            if ch == '\n' {
-                line_num += 1;
-            }
-        }
-        // Pad to cover the full length
-        while map.len() <= input.len() {
-            map.push(line_num);
-        }
-        map
-    };
-
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    let mut source_map: Vec<usize> = Vec::new();
-    let mut current_spans: Vec<Span<'static>> = Vec::new();
-    let mut style_stack: Vec<Style> = vec![Style::default()];
-    let mut list_depth: usize = 0;
-    let mut list_indices: Vec<Option<u64>> = Vec::new();
+/// Highlight markdown lines and soft-wrap at max_width.
+fn highlight_and_wrap(lines: &[String], max_width: usize) -> DisplayMap {
+    let mut display_lines: Vec<Line<'static>> = Vec::new();
+    let mut map: Vec<(usize, usize)> = Vec::new();
     let mut in_code_block = false;
-    let mut code_block_buf = String::new();
-    let mut heading_level = HeadingLevel::H1;
+    let code_bg = Color::Rgb(40, 40, 40);
 
-    let mut table_row: Vec<String> = Vec::new();
-    let mut table_header: Vec<String> = Vec::new();
-    let mut table_rows: Vec<Vec<String>> = Vec::new();
-    let mut is_header_row = false;
-    let mut current_cell = String::new();
-    let mut in_cell = false;
-
-    // Track the current source line based on parser offsets
-    let mut current_source_line: usize = 0;
-
-    // Use offset iter to track positions
-    let parser_with_offsets: Vec<_> = {
-        let parser = Parser::new_ext(input, options);
-        parser.into_offset_iter().collect()
-    };
-
-    for (event, range) in parser_with_offsets {
-        // Update current source line from the byte offset
-        if let Some(&line) = byte_to_line.get(range.start) {
-            current_source_line = line;
+    for (src_idx, line) in lines.iter().enumerate() {
+        // Code fence toggles
+        if line.starts_with("```") {
+            in_code_block = !in_code_block;
+            let padded = pad_to_width(line, max_width);
+            display_lines.push(Line::from(Span::styled(
+                padded,
+                Style::default().fg(Color::DarkGray).bg(code_bg),
+            )));
+            map.push((src_idx, 0));
+            continue;
         }
 
-        match event {
-            MdEvent::Start(tag) => match tag {
-                Tag::Heading { level, .. } => {
-                    heading_level = level;
-                }
-                Tag::Paragraph => {}
-                Tag::Emphasis => {
-                    let current = current_style(&style_stack);
-                    style_stack.push(current.add_modifier(Modifier::ITALIC));
-                }
-                Tag::Strong => {
-                    let current = current_style(&style_stack);
-                    style_stack.push(current.add_modifier(Modifier::BOLD));
-                }
-                Tag::Strikethrough => {
-                    let current = current_style(&style_stack);
-                    style_stack.push(current.add_modifier(Modifier::CROSSED_OUT));
-                }
-                Tag::CodeBlock(_) => {
-                    in_code_block = true;
-                    code_block_buf.clear();
-                    flush_line(&mut lines, &mut source_map, &mut current_spans, max_width, current_source_line);
-                }
-                Tag::List(start) => {
-                    list_depth += 1;
-                    list_indices.push(start);
-                }
-                Tag::Item => {
-                    let indent = "  ".repeat(list_depth.saturating_sub(1));
-                    let bullet = if let Some(idx) = list_indices.last_mut() {
-                        if let Some(n) = idx {
-                            let b = format!("{}{}. ", indent, n);
-                            *n += 1;
-                            b
-                        } else {
-                            format!("{}• ", indent)
-                        }
-                    } else {
-                        format!("{}• ", indent)
-                    };
-                    current_spans.push(Span::styled(bullet, Style::default().fg(Color::Cyan)));
-                }
-                Tag::BlockQuote(_) => {
-                    current_spans.push(Span::styled(
-                        "│ ",
-                        Style::default().fg(Color::DarkGray),
-                    ));
-                    let current = current_style(&style_stack);
-                    style_stack.push(current.fg(Color::Gray));
-                }
-                Tag::Link { dest_url, .. } => {
-                    let current = current_style(&style_stack);
-                    style_stack.push(
-                        current
-                            .fg(Color::Blue)
-                            .add_modifier(Modifier::UNDERLINED),
-                    );
-                    let _ = dest_url;
-                }
-                Tag::Table(_alignments) => {
-                    table_header.clear();
-                    table_rows.clear();
-                    flush_line(&mut lines, &mut source_map, &mut current_spans, max_width, current_source_line);
-                }
-                Tag::TableHead => {
-                    is_header_row = true;
-                    table_row.clear();
-                }
-                Tag::TableRow => {
-                    is_header_row = false;
-                    table_row.clear();
-                }
-                Tag::TableCell => {
-                    in_cell = true;
-                    current_cell.clear();
-                }
-                _ => {}
-            },
-            MdEvent::End(tag_end) => match tag_end {
-                TagEnd::Heading(_) => {
-                    let (color, prefix) = match heading_level {
-                        HeadingLevel::H1 => (Color::Magenta, "# "),
-                        HeadingLevel::H2 => (Color::Green, "## "),
-                        HeadingLevel::H3 => (Color::Yellow, "### "),
-                        HeadingLevel::H4 => (Color::Cyan, "#### "),
-                        HeadingLevel::H5 => (Color::Blue, "##### "),
-                        HeadingLevel::H6 => (Color::DarkGray, "###### "),
-                    };
-                    let style = Style::default().fg(color).add_modifier(Modifier::BOLD);
-                    let mut heading_spans = vec![Span::styled(prefix.to_string(), style)];
-                    for span in current_spans.drain(..) {
-                        heading_spans.push(Span::styled(span.content.to_string(), style));
-                    }
-                    lines.push(Line::from(heading_spans));
-                    source_map.push(current_source_line);
-                    lines.push(Line::from(""));
-                    source_map.push(current_source_line);
-                }
-                TagEnd::Paragraph => {
-                    flush_line(&mut lines, &mut source_map, &mut current_spans, max_width, current_source_line);
-                    lines.push(Line::from(""));
-                    source_map.push(current_source_line);
-                }
-                TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough => {
-                    style_stack.pop();
-                }
-                TagEnd::CodeBlock => {
-                    in_code_block = false;
-                    let block_style = Style::default().fg(Color::Gray).bg(Color::Rgb(40, 40, 40));
-                    let margin = " ".repeat(CODE_MARGIN / 2);
-                    let trimmed = code_block_buf.trim_end_matches('\n');
-                    let inner_width = code_width;
+        // Inside code block — no wrapping, pad to width
+        if in_code_block {
+            let padded = pad_to_width(line, max_width);
+            display_lines.push(Line::from(Span::styled(
+                padded,
+                Style::default().fg(Color::Gray).bg(code_bg),
+            )));
+            map.push((src_idx, 0));
+            continue;
+        }
 
-                    let top_pad = format!("{}{}", margin, " ".repeat(inner_width));
-                    lines.push(Line::from(Span::styled(top_pad, block_style)));
-                    source_map.push(current_source_line);
+        // Highlight the line
+        let spans = highlight_source_line(line);
 
-                    for code_line in trimmed.split('\n') {
-                        let visible_len = code_line.len();
-                        let content = if visible_len >= inner_width - 2 {
-                            format!(" {}", &code_line[..inner_width - 2])
-                        } else {
-                            format!(" {}{}", code_line, " ".repeat(inner_width - 1 - visible_len))
-                        };
-                        let padded = format!("{}{}", margin, content);
-                        lines.push(Line::from(Span::styled(padded, block_style)));
-                        source_map.push(current_source_line);
-                        current_source_line += 1;
-                    }
+        // If it fits, no wrapping needed
+        let total_len: usize = spans.iter().map(|s| s.content.len()).sum();
+        if total_len <= max_width {
+            display_lines.push(Line::from(spans));
+            map.push((src_idx, 0));
+            continue;
+        }
 
-                    let bot_pad = format!("{}{}", margin, " ".repeat(inner_width));
-                    lines.push(Line::from(Span::styled(bot_pad, block_style)));
-                    source_map.push(current_source_line);
-                    lines.push(Line::from(""));
-                    source_map.push(current_source_line);
-                }
-                TagEnd::List(_) => {
-                    list_depth = list_depth.saturating_sub(1);
-                    list_indices.pop();
-                    if list_depth == 0 {
-                        lines.push(Line::from(""));
-                        source_map.push(current_source_line);
-                    }
-                }
-                TagEnd::Item => {
-                    flush_line(&mut lines, &mut source_map, &mut current_spans, max_width, current_source_line);
-                }
-                TagEnd::BlockQuote(_) => {
-                    style_stack.pop();
-                    flush_line(&mut lines, &mut source_map, &mut current_spans, max_width, current_source_line);
-                }
-                TagEnd::Link => {
-                    style_stack.pop();
-                }
-                TagEnd::Table => {
-                    let num_cols = table_header.len();
-                    let mut col_widths: Vec<usize> = table_header.iter().map(|c| c.len()).collect();
-                    for row in &table_rows {
-                        for (i, cell) in row.iter().enumerate() {
-                            if i < col_widths.len() {
-                                col_widths[i] = col_widths[i].max(cell.len());
-                            }
-                        }
-                    }
-
-                    let border_style = Style::default().fg(Color::DarkGray);
-                    let header_style = Style::default()
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD);
-                    let cell_style = Style::default().fg(Color::White);
-
-                    let top: Vec<String> = col_widths.iter().map(|w| "─".repeat(w + 2)).collect();
-                    lines.push(Line::from(Span::styled(
-                        format!("┌{}┐", top.join("┬")),
-                        border_style,
-                    )));
-                    source_map.push(current_source_line);
-
-                    let mut header_spans: Vec<Span<'static>> = vec![
-                        Span::styled("│", border_style),
-                    ];
-                    for (i, cell) in table_header.iter().enumerate() {
-                        let w = col_widths.get(i).copied().unwrap_or(0);
-                        header_spans.push(Span::styled(
-                            format!(" {:width$} ", cell, width = w),
-                            header_style,
-                        ));
-                        header_spans.push(Span::styled("│", border_style));
-                    }
-                    lines.push(Line::from(header_spans));
-                    source_map.push(current_source_line);
-
-                    let sep: Vec<String> = col_widths.iter().map(|w| "═".repeat(w + 2)).collect();
-                    lines.push(Line::from(Span::styled(
-                        format!("╞{}╡", sep.join("╪")),
-                        border_style,
-                    )));
-                    source_map.push(current_source_line);
-
-                    for row in &table_rows {
-                        let mut row_spans: Vec<Span<'static>> = vec![
-                            Span::styled("│", border_style),
-                        ];
-                        for (i, cell) in row.iter().enumerate() {
-                            let w = col_widths.get(i).copied().unwrap_or(0);
-                            row_spans.push(Span::styled(
-                                format!(" {:width$} ", cell, width = w),
-                                cell_style,
-                            ));
-                            row_spans.push(Span::styled("│", border_style));
-                        }
-                        for i in row.len()..num_cols {
-                            let w = col_widths.get(i).copied().unwrap_or(0);
-                            row_spans.push(Span::styled(
-                                format!(" {:width$} ", "", width = w),
-                                cell_style,
-                            ));
-                            row_spans.push(Span::styled("│", border_style));
-                        }
-                        lines.push(Line::from(row_spans));
-                        source_map.push(current_source_line);
-                        current_source_line += 1;
-                    }
-
-                    let bot: Vec<String> = col_widths.iter().map(|w| "─".repeat(w + 2)).collect();
-                    lines.push(Line::from(Span::styled(
-                        format!("└{}┘", bot.join("┴")),
-                        border_style,
-                    )));
-                    source_map.push(current_source_line);
-                    lines.push(Line::from(""));
-                    source_map.push(current_source_line);
-                }
-                TagEnd::TableHead => {
-                    table_header = table_row.clone();
-                    table_row.clear();
-                }
-                TagEnd::TableRow => {
-                    if !is_header_row {
-                        table_rows.push(table_row.clone());
-                    }
-                    table_row.clear();
-                }
-                TagEnd::TableCell => {
-                    in_cell = false;
-                    table_row.push(current_cell.clone());
-                }
-                _ => {}
-            },
-            MdEvent::Text(text) => {
-                if in_code_block {
-                    code_block_buf.push_str(&text);
-                } else if in_cell {
-                    current_cell.push_str(&text);
-                } else {
-                    let style = current_style(&style_stack);
-                    current_spans.push(Span::styled(text.to_string(), style));
-                }
-            }
-            MdEvent::Code(code) => {
-                if in_cell {
-                    current_cell.push_str(&format!("`{}`", code));
-                } else {
-                    current_spans.push(Span::styled(
-                        format!(" {} ", code),
-                        Style::default().fg(Color::Yellow).bg(Color::Rgb(40, 40, 40)),
-                    ));
-                }
-            }
-            MdEvent::SoftBreak => {
-                if !in_code_block {
-                    current_spans.push(Span::raw(" "));
-                }
-            }
-            MdEvent::HardBreak => {
-                flush_line(&mut lines, &mut source_map, &mut current_spans, max_width, current_source_line);
-            }
-            MdEvent::Rule => {
-                lines.push(Line::from(Span::styled(
-                    "─".repeat(max_width),
-                    Style::default().fg(Color::DarkGray),
-                )));
-                source_map.push(current_source_line);
-                lines.push(Line::from(""));
-                source_map.push(current_source_line);
-            }
-            MdEvent::TaskListMarker(checked) => {
-                let marker = if checked { "☑ " } else { "☐ " };
-                current_spans.push(Span::styled(
-                    marker.to_string(),
-                    Style::default().fg(Color::Cyan),
-                ));
-            }
-            _ => {}
+        // Soft-wrap the spans
+        let wrapped = wrap_spans(&spans, max_width);
+        let mut col_offset = 0usize;
+        for wrapped_line in wrapped {
+            let line_len: usize = wrapped_line.iter().map(|s| s.content.len()).sum();
+            display_lines.push(Line::from(wrapped_line));
+            map.push((src_idx, col_offset));
+            col_offset += line_len;
         }
     }
 
-    flush_line(&mut lines, &mut source_map, &mut current_spans, max_width, current_source_line);
-    RenderResult { lines, source_map }
+    DisplayMap {
+        lines: display_lines,
+        map,
+    }
 }
 
-fn current_style(stack: &[Style]) -> Style {
-    stack.last().copied().unwrap_or_default()
+/// Highlight a single source line based on markdown syntax.
+fn highlight_source_line(line: &str) -> Vec<Span<'static>> {
+    // Headings
+    if let Some(level) = heading_level(line) {
+        let color = match level {
+            1 => Color::Magenta,
+            2 => Color::Green,
+            3 => Color::Yellow,
+            4 => Color::Cyan,
+            _ => Color::Blue,
+        };
+        return highlight_inline(
+            line,
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        );
+    }
+
+    // Horizontal rules
+    let trimmed = line.trim();
+    if (trimmed == "---" || trimmed == "***" || trimmed == "___") && trimmed.len() >= 3 {
+        return vec![Span::styled(
+            line.to_string(),
+            Style::default().fg(Color::DarkGray),
+        )];
+    }
+
+    // Block quotes
+    if line.starts_with('>') {
+        return highlight_inline(line, Style::default().fg(Color::Gray));
+    }
+
+    // Table lines
+    if line.starts_with('|') {
+        if line.contains("---") || line.contains("===") {
+            return vec![Span::styled(
+                line.to_string(),
+                Style::default().fg(Color::DarkGray),
+            )];
+        } else {
+            return highlight_inline(line, Style::default().fg(Color::White));
+        }
+    }
+
+    // List items
+    if is_list_item(line) {
+        return highlight_list_item(line);
+    }
+
+    // Regular text
+    highlight_inline(line, Style::default())
 }
 
-fn flush_line(
-    lines: &mut Vec<Line<'static>>,
-    source_map: &mut Vec<usize>,
-    spans: &mut Vec<Span<'static>>,
-    max_width: usize,
-    source_line: usize,
-) {
-    if spans.is_empty() {
-        return;
-    }
-
-    let total_len: usize = spans.iter().map(|s| s.content.len()).sum();
-
-    if total_len <= max_width {
-        lines.push(Line::from(spans.drain(..).collect::<Vec<_>>()));
-        source_map.push(source_line);
-        return;
-    }
-
+/// Word-wrap a list of styled spans at max_width.
+fn wrap_spans(spans: &[Span<'static>], max_width: usize) -> Vec<Vec<Span<'static>>> {
+    let mut result: Vec<Vec<Span<'static>>> = Vec::new();
     let mut current_line: Vec<Span<'static>> = Vec::new();
     let mut current_len: usize = 0;
 
-    for span in spans.drain(..) {
+    for span in spans {
         let style = span.style;
         let text = span.content.to_string();
 
@@ -680,11 +709,9 @@ fn flush_line(
             let word_len = word.len();
 
             if current_len + word_len > max_width && current_len > 0 {
-                lines.push(Line::from(
-                    current_line.drain(..).collect::<Vec<_>>(),
-                ));
-                source_map.push(source_line);
+                result.push(std::mem::take(&mut current_line));
                 current_len = 0;
+
                 let trimmed = word.trim_start();
                 if !trimmed.is_empty() {
                     current_len = trimmed.len();
@@ -698,8 +725,239 @@ fn flush_line(
     }
 
     if !current_line.is_empty() {
-        lines.push(Line::from(current_line));
-        source_map.push(source_line);
+        result.push(current_line);
+    }
+
+    if result.is_empty() {
+        result.push(vec![Span::raw(String::new())]);
+    }
+
+    result
+}
+
+fn heading_level(line: &str) -> Option<usize> {
+    let trimmed = line.trim_start();
+    let hashes = trimmed.bytes().take_while(|&b| b == b'#').count();
+    if hashes > 0 && hashes <= 6 && trimmed.as_bytes().get(hashes) == Some(&b' ') {
+        Some(hashes)
+    } else {
+        None
+    }
+}
+
+fn is_list_item(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with("- ") || trimmed.starts_with("* ") || trimmed.starts_with("+ ") {
+        return true;
+    }
+    if let Some(dot_pos) = trimmed.find(". ") {
+        return trimmed[..dot_pos].chars().all(|c| c.is_ascii_digit()) && dot_pos > 0;
+    }
+    false
+}
+
+fn highlight_list_item(line: &str) -> Vec<Span<'static>> {
+    let trimmed = line.trim_start();
+    let indent_len = line.len() - trimmed.len();
+    let indent = &line[..indent_len];
+
+    let (bullet, rest) = if trimmed.starts_with("- ")
+        || trimmed.starts_with("* ")
+        || trimmed.starts_with("+ ")
+    {
+        (&trimmed[..2], &trimmed[2..])
+    } else if let Some(dot_pos) = trimmed.find(". ") {
+        (&trimmed[..dot_pos + 2], &trimmed[dot_pos + 2..])
+    } else {
+        return highlight_inline(line, Style::default());
+    };
+
+    let mut spans = vec![
+        Span::raw(indent.to_string()),
+        Span::styled(bullet.to_string(), Style::default().fg(Color::Cyan)),
+    ];
+    spans.extend(highlight_inline(rest, Style::default()));
+    spans
+}
+
+/// Parse inline markdown: **bold**, *italic*, ~~strikethrough~~, `code`, [links](url)
+fn highlight_inline(text: &str, base_style: Style) -> Vec<Span<'static>> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let chars: Vec<char> = text.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+    let mut plain_start = 0;
+
+    while i < len {
+        // Inline code: `...`
+        if chars[i] == '`' {
+            if i > plain_start {
+                spans.push(Span::styled(
+                    chars[plain_start..i].iter().collect::<String>(),
+                    base_style,
+                ));
+            }
+            if let Some(end) = find_closing(&chars, i + 1, '`') {
+                let code_text: String = chars[i..=end].iter().collect();
+                spans.push(Span::styled(
+                    code_text,
+                    Style::default().fg(Color::Yellow).bg(Color::Rgb(40, 40, 40)),
+                ));
+                i = end + 1;
+                plain_start = i;
+                continue;
+            }
+        }
+
+        // Bold: **...**
+        if i + 1 < len && chars[i] == '*' && chars[i + 1] == '*' {
+            if i > plain_start {
+                spans.push(Span::styled(
+                    chars[plain_start..i].iter().collect::<String>(),
+                    base_style,
+                ));
+            }
+            if let Some(end) = find_closing_double(&chars, i + 2, '*') {
+                let bold_text: String = chars[i..=end + 1].iter().collect();
+                spans.push(Span::styled(
+                    bold_text,
+                    base_style.add_modifier(Modifier::BOLD),
+                ));
+                i = end + 2;
+                plain_start = i;
+                continue;
+            }
+        }
+
+        // Italic: *...*
+        if chars[i] == '*' && (i + 1 < len && chars[i + 1] != '*') {
+            if i > plain_start {
+                spans.push(Span::styled(
+                    chars[plain_start..i].iter().collect::<String>(),
+                    base_style,
+                ));
+            }
+            if let Some(end) = find_closing(&chars, i + 1, '*') {
+                let italic_text: String = chars[i..=end].iter().collect();
+                spans.push(Span::styled(
+                    italic_text,
+                    base_style.add_modifier(Modifier::ITALIC),
+                ));
+                i = end + 1;
+                plain_start = i;
+                continue;
+            }
+        }
+
+        // Strikethrough: ~~...~~
+        if i + 1 < len && chars[i] == '~' && chars[i + 1] == '~' {
+            if i > plain_start {
+                spans.push(Span::styled(
+                    chars[plain_start..i].iter().collect::<String>(),
+                    base_style,
+                ));
+            }
+            if let Some(end) = find_closing_double(&chars, i + 2, '~') {
+                let strike_text: String = chars[i..=end + 1].iter().collect();
+                spans.push(Span::styled(
+                    strike_text,
+                    base_style.add_modifier(Modifier::CROSSED_OUT),
+                ));
+                i = end + 2;
+                plain_start = i;
+                continue;
+            }
+        }
+
+        // Links: [text](url)
+        if chars[i] == '[' {
+            if i > plain_start {
+                spans.push(Span::styled(
+                    chars[plain_start..i].iter().collect::<String>(),
+                    base_style,
+                ));
+            }
+            if let Some((bracket_end, paren_end)) = find_link(&chars, i) {
+                let link_text: String = chars[i..=bracket_end].iter().collect();
+                let url_text: String = chars[bracket_end + 1..=paren_end].iter().collect();
+                spans.push(Span::styled(
+                    link_text,
+                    base_style.fg(Color::Blue).add_modifier(Modifier::UNDERLINED),
+                ));
+                spans.push(Span::styled(
+                    url_text,
+                    Style::default().fg(Color::DarkGray),
+                ));
+                i = paren_end + 1;
+                plain_start = i;
+                continue;
+            }
+        }
+
+        i += 1;
+    }
+
+    if plain_start < len {
+        spans.push(Span::styled(
+            chars[plain_start..].iter().collect::<String>(),
+            base_style,
+        ));
+    }
+
+    if spans.is_empty() {
+        spans.push(Span::styled(String::new(), base_style));
+    }
+
+    spans
+}
+
+fn find_closing(chars: &[char], start: usize, delim: char) -> Option<usize> {
+    for i in start..chars.len() {
+        if chars[i] == delim {
+            return Some(i);
+        }
+    }
+    None
+}
+
+fn find_closing_double(chars: &[char], start: usize, delim: char) -> Option<usize> {
+    let mut i = start;
+    while i + 1 < chars.len() {
+        if chars[i] == delim && chars[i + 1] == delim {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+fn find_link(chars: &[char], start: usize) -> Option<(usize, usize)> {
+    let mut i = start + 1;
+    while i < chars.len() && chars[i] != ']' {
+        i += 1;
+    }
+    if i >= chars.len() {
+        return None;
+    }
+    let bracket_end = i;
+    if bracket_end + 1 >= chars.len() || chars[bracket_end + 1] != '(' {
+        return None;
+    }
+    i = bracket_end + 2;
+    while i < chars.len() && chars[i] != ')' {
+        i += 1;
+    }
+    if i >= chars.len() {
+        return None;
+    }
+    Some((bracket_end, i))
+}
+
+fn pad_to_width(text: &str, width: usize) -> String {
+    if text.len() >= width {
+        text.to_string()
+    } else {
+        format!("{}{}", text, " ".repeat(width - text.len()))
     }
 }
 
