@@ -1,6 +1,5 @@
 use std::process::Command;
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::Config;
 
@@ -14,7 +13,6 @@ pub struct SyncClient {
     ssh_user: String,
     port: u16,
     docs_path: String,
-    user_name: String,
 }
 
 impl SyncClient {
@@ -24,7 +22,6 @@ impl SyncClient {
             ssh_user: config.server.ssh_user.clone(),
             port: config.server.port,
             docs_path: config.server.docs_path.clone(),
-            user_name: config.user.name.clone(),
         }
     }
 
@@ -89,118 +86,6 @@ impl SyncClient {
         } else {
             Err(format!(
                 "Failed to create remote dirs: {}",
-                String::from_utf8_lossy(&output.stderr)
-            ))
-        }
-    }
-
-    /// Push a yrs update delta to the server
-    pub fn push_update(&self, relative_path: &str, update: &[u8]) -> Result<(), String> {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis();
-        let filename = format!("{}_{}", self.user_name, timestamp);
-        let remote_path = format!(
-            "{}:{}",
-            self.ssh_dest(),
-            format!("{}/{}", self.updates_dir(relative_path), filename)
-        );
-
-        // Write update to a temp file, then scp it
-        let tmp = std::env::temp_dir().join(format!("wiremd_update_{}", timestamp));
-        std::fs::write(&tmp, update)
-            .map_err(|e| format!("Failed to write temp file: {}", e))?;
-
-        let output = self.scp_cmd()
-            .arg(tmp.to_str().unwrap())
-            .arg(&remote_path)
-            .output()
-            .map_err(|e| format!("SCP push failed: {}", e))?;
-
-        let _ = std::fs::remove_file(&tmp);
-
-        if output.status.success() {
-            Ok(())
-        } else {
-            Err(format!(
-                "SCP push failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            ))
-        }
-    }
-
-    /// Push multiple updates as a single merged blob
-    pub fn push_updates(&self, relative_path: &str, updates: &[Vec<u8>]) -> Result<(), String> {
-        if updates.is_empty() {
-            return Ok(());
-        }
-        // Merge all updates into one
-        let merged = yrs_merge_updates(updates)?;
-        self.push_update(relative_path, &merged)
-    }
-
-    /// Pull all pending update deltas from the server
-    pub fn pull_updates(&self, relative_path: &str) -> Result<Vec<Vec<u8>>, String> {
-        let updates_dir = self.updates_dir(relative_path);
-
-        // List files in updates dir
-        let output = self.ssh_cmd()
-            .arg(format!("ls -1 {} 2>/dev/null || true", updates_dir))
-            .output()
-            .map_err(|e| format!("SSH ls failed: {}", e))?;
-
-        let file_list = String::from_utf8_lossy(&output.stdout);
-        let files: Vec<&str> = file_list.lines().filter(|l| !l.is_empty()).collect();
-
-        if files.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let mut updates = Vec::new();
-        let tmp_dir = std::env::temp_dir().join("wiremd_pull");
-        let _ = std::fs::create_dir_all(&tmp_dir);
-
-        for file in &files {
-            let remote = format!(
-                "{}:{}/{}",
-                self.ssh_dest(),
-                updates_dir,
-                file
-            );
-            let local = tmp_dir.join(file);
-
-            let output = self.scp_cmd()
-                .arg(&remote)
-                .arg(local.to_str().unwrap())
-                .output()
-                .map_err(|e| format!("SCP pull failed: {}", e))?;
-
-            if output.status.success() {
-                if let Ok(data) = std::fs::read(&local) {
-                    updates.push(data);
-                }
-                let _ = std::fs::remove_file(&local);
-            }
-        }
-
-        let _ = std::fs::remove_dir(&tmp_dir);
-        Ok(updates)
-    }
-
-    /// Clear pulled updates from the server (after successfully applying them)
-    pub fn clear_updates(&self, relative_path: &str) -> Result<(), String> {
-        let updates_dir = self.updates_dir(relative_path);
-        let output = self.ssh_cmd()
-            .arg(format!("rm -f {}/* 2>/dev/null || true", updates_dir))
-            .output()
-            .map_err(|e| format!("SSH rm failed: {}", e))?;
-
-        if output.status.success() {
-            Ok(())
-        } else {
-            Err(format!(
-                "Failed to clear remote updates: {}",
                 String::from_utf8_lossy(&output.stderr)
             ))
         }
@@ -355,18 +240,4 @@ impl SyncClient {
     pub fn host(&self) -> &str {
         &self.host
     }
-}
-
-/// Merge multiple yrs updates into one
-fn yrs_merge_updates(updates: &[Vec<u8>]) -> Result<Vec<u8>, String> {
-    use yrs::updates::decoder::Decode;
-    use yrs::updates::encoder::Encode;
-    use yrs::Update;
-
-    let parsed: Result<Vec<Update>, _> = updates.iter().map(|u| Update::decode_v1(u)).collect();
-    let parsed = parsed.map_err(|e| format!("Failed to decode updates: {}", e))?;
-
-    let merged = Update::merge_updates(parsed);
-
-    Ok(merged.encode_v1())
 }

@@ -220,11 +220,6 @@ impl Browser {
         self.client.read_remote_file(relative_path)
     }
 
-    /// Consume self and return the SyncClient for reuse
-    pub fn into_client(self) -> SyncClient {
-        self.client
-    }
-
     /// Get visible entries (filtered by search, respecting expand state)
     fn visible_entries(&self) -> Vec<usize> {
         let mut result = Vec::new();
