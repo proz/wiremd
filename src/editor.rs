@@ -418,13 +418,6 @@ impl Editor {
                 let event = Event::Key(key);
                 if self.textarea.input(event) {
                     self.modified = true;
-
-                    let current = textarea_content(&self.textarea);
-                    sync_to_yrs(&self.text, &self.doc, &self.last_synced_content, &current);
-                    self.last_synced_content = current;
-
-                    let mut u = self.updates.lock().unwrap();
-                    self.pending_updates.extend(u.drain(..));
                 }
             }
         }
