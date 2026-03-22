@@ -303,6 +303,58 @@ impl SyncClient {
             ))
         }
     }
+    /// List markdown files on the remote server. Returns relative paths sorted.
+    pub fn list_remote_files(&self) -> Result<Vec<String>, String> {
+        let output = self.ssh_cmd()
+            .arg(format!(
+                "find {} -name '*.md' -type f -printf '%P\\n' 2>/dev/null | sort",
+                self.docs_path
+            ))
+            .output()
+            .map_err(|e| format!("SSH find failed: {}", e))?;
+
+        if !output.status.success() {
+            return Err(format!(
+                "Failed to list remote files: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+
+        let files = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| l.to_string())
+            .collect();
+        Ok(files)
+    }
+
+    /// Read a file from the remote server.
+    pub fn read_remote_file(&self, relative_path: &str) -> Result<String, String> {
+        let output = self.ssh_cmd()
+            .arg(format!("cat {}/{}", self.docs_path, relative_path))
+            .output()
+            .map_err(|e| format!("SSH cat failed: {}", e))?;
+
+        if output.status.success() {
+            String::from_utf8(output.stdout)
+                .map_err(|e| format!("Invalid UTF-8 in remote file: {}", e))
+        } else {
+            Err(format!(
+                "Failed to read remote file: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ))
+        }
+    }
+
+    /// Get the remote docs_path (for display).
+    pub fn docs_path(&self) -> &str {
+        &self.docs_path
+    }
+
+    /// Get the host (for display).
+    pub fn host(&self) -> &str {
+        &self.host
+    }
 }
 
 /// Merge multiple yrs updates into one

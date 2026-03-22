@@ -1,13 +1,13 @@
 # wiremd
-
-A terminal-native collaborative markdown editor using CRDTs for conflict-free sync over SSH.
+terminal-native collaborative markdown editor using CRDTs for conflict-free sync over SSH.
 
 ## Architecture
 
 - **Approach**: Hybrid — dumb SSH file server for storage, yrs CRDT for sync correctness, local-first editing
 - **Server**: No daemon. Just a filesystem accessible via SSH (sshd + filesystem). Stores markdown files and yrs update deltas
 - **Client**: Rust TUI application that edits locally, syncs via SSH push/pull of yrs deltas
-sdfsdfsdfsdf - **Sync model**: Not real-time keystroke streaming. Sync on save or periodic polling. Users don't need to be online simultaneously. yrs guarantees convergence regardless of update ordering
+- **Sync model**: Not real-time keystroke streaming. Sync on save
+or periodic polling. Users don't need to be online simultaneously. yrs guarantees convergence regardless of update ordering
 
 ## Tech Stack
 
@@ -25,8 +25,8 @@ sdfsdfsdfsdf - **Sync model**: Not real-time keystroke streaming. Sync on save o
 
 ## Current State
 
-### Working
-- Markdown viewer with rendered output (headings, code blocks, tables, lists, links, blockquotes, rules, task lists, inline code)
+### Working 123- Markdown viewer with rendered output (headings, code
+blocks, tables, lists, links, blockquotes, rules, task lists, inline code)
 - Word wrapping at configurable MAX_WIDTH (80)
 - Code blocks with uniform background and margin indentation
 - Tables with box-drawing borders, aligned columns, bold headers, empty cell support
