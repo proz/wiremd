@@ -116,22 +116,39 @@ impl Editor {
             }
         }
 
-        // If no remote state, initialize yrs doc from local content
+        // Reflow for editing, then use reflowed content as the canonical form
+        // everywhere (yrs doc, textarea, last_synced_content must all agree)
+        let reflowed = reflow(&initial_content, MAX_WIDTH);
+
+        // Initialize yrs doc with reflowed content (same as what textarea will have)
         {
             let txn = doc.transact();
             if text.get_string(&txn).is_empty() {
                 drop(txn);
                 let mut txn = doc.transact_mut();
-                text.insert(&mut txn, 0, &initial_content);
+                text.insert(&mut txn, 0, &reflowed);
+            } else {
+                // yrs already has content from remote — sync it to reflowed form
+                drop(txn);
+                let current_yrs = {
+                    let txn = doc.transact();
+                    text.get_string(&txn)
+                };
+                if current_yrs != reflowed {
+                    sync_to_yrs(&text, &doc, &current_yrs, &reflowed);
+                }
             }
         }
 
-        let reflowed = reflow(&initial_content, MAX_WIDTH);
         let mut textarea = TextArea::from(
             reflowed.lines().map(|l| l.to_string()).collect::<Vec<_>>(),
         );
         textarea.set_cursor_line_style(Style::default());
         textarea.set_cursor_style(Style::default());
+
+        // textarea_content() joins lines with \n and appends \n
+        // We need last_synced_content to match that exact format
+        let synced_content = textarea_content(&textarea);
 
         let updates = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
         let updates_clone = updates.clone();
@@ -151,7 +168,7 @@ impl Editor {
             modified: false,
             sync_status,
             sync_client,
-            last_synced_content: initial_content,
+            last_synced_content: synced_content,
             pending_updates: Vec::new(),
             updates,
             _sub,
@@ -396,13 +413,15 @@ impl Editor {
     /// 5. Write merged text locally
     /// 6. Push local yrs state to server (full snapshot)
     /// 7. Push merged markdown file to server
-    /// Reload the textarea with new content, preserving cursor style
+    /// Reload the textarea with new content, update last_synced_content to match
     fn reload_textarea(&mut self, content: &str) {
         self.textarea = TextArea::from(
             content.lines().map(|l| l.to_string()).collect::<Vec<_>>(),
         );
         self.textarea.set_cursor_line_style(Style::default());
         self.textarea.set_cursor_style(Style::default());
+        // Keep last_synced_content in sync with textarea_content()
+        self.last_synced_content = textarea_content(&self.textarea);
     }
 
     fn save_and_sync(&mut self) -> Result<Option<String>, String> {
@@ -453,11 +472,14 @@ impl Editor {
 
             // Compare merged content with what we had locally
             let changed = merged != local_content;
-            self.last_synced_content = merged.clone();
 
             if changed {
+                // After reload_textarea, last_synced_content must match textarea_content()
+                // We'll set it in the caller after reload
+                self.last_synced_content = merged.clone();
                 Ok(Some(merged))
             } else {
+                self.last_synced_content = local_content;
                 Ok(None)
             }
         } else {
