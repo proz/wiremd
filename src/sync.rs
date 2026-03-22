@@ -244,12 +244,14 @@ impl SyncClient {
     }
 
     /// Start watching a remote .yrs file for changes via inotifywait.
-    /// Returns a channel receiver that gets a message whenever the file changes,
-    /// and the child process handle (kill it when done).
+    /// The background thread detects changes AND pulls the state,
+    /// sending the pulled bytes through the channel so the main thread
+    /// only needs to apply the update (no I/O on main thread).
+    /// Returns a channel receiver and child process handle.
     pub fn watch_remote(
         &self,
         relative_path: &str,
-    ) -> Result<(mpsc::Receiver<()>, Child), String> {
+    ) -> Result<(mpsc::Receiver<Vec<u8>>, Child), String> {
         let yrs_path = self.yrs_state_path(relative_path);
 
         let mut child = Command::new("ssh")
@@ -272,13 +274,33 @@ impl SyncClient {
         let stdout = child.stdout.take()
             .ok_or("Failed to capture watcher stdout")?;
 
+        let port = self.port;
+        let remote_yrs = format!("{}@{}:{}", self.ssh_user, self.host, yrs_path);
+
         std::thread::spawn(move || {
             let reader = std::io::BufReader::new(stdout);
             for line in reader.lines() {
-                if line.is_ok() {
-                    // File was modified — notify the main thread
-                    if tx.send(()).is_err() {
-                        break; // receiver dropped, stop watching
+                if line.is_err() {
+                    break;
+                }
+                // File changed — pull the state in this background thread
+                let tmp = std::env::temp_dir().join("wiremd_watch_pull");
+                let output = Command::new("scp")
+                    .arg("-P").arg(port.to_string())
+                    .arg("-o").arg("BatchMode=yes")
+                    .arg("-o").arg("ConnectTimeout=5")
+                    .arg(&remote_yrs)
+                    .arg(tmp.to_str().unwrap())
+                    .output();
+
+                if let Ok(out) = output {
+                    if out.status.success() {
+                        if let Ok(data) = std::fs::read(&tmp) {
+                            if tx.send(data).is_err() {
+                                break; // receiver dropped
+                            }
+                        }
+                        let _ = std::fs::remove_file(&tmp);
                     }
                 }
             }

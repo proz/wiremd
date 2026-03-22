@@ -82,7 +82,7 @@ pub struct Editor {
     pending_updates: Vec<Vec<u8>>,
     updates: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
     _sub: yrs::Subscription,
-    watcher_rx: Option<mpsc::Receiver<()>>,
+    watcher_rx: Option<mpsc::Receiver<Vec<u8>>>,
     _watcher_child: Option<Child>,
     user_name: String,
     online_users: Vec<String>,
@@ -204,12 +204,15 @@ impl Editor {
 
     pub fn run(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
         loop {
-            // Check for remote changes from inotifywait watcher
+            // Check for remote changes (pre-pulled by background thread)
             if let Some(ref rx) = self.watcher_rx {
-                if rx.try_recv().is_ok() {
-                    // Drain any extra notifications
-                    while rx.try_recv().is_ok() {}
-                    self.pull_remote_changes();
+                let mut latest_state: Option<Vec<u8>> = None;
+                // Drain all pending — only use the latest
+                while let Ok(state) = rx.try_recv() {
+                    latest_state = Some(state);
+                }
+                if let Some(state) = latest_state {
+                    self.apply_remote_state(&state);
                 }
             }
 
@@ -244,22 +247,9 @@ impl Editor {
         Ok(())
     }
 
-    /// Pull remote changes and merge into local doc
-    fn pull_remote_changes(&mut self) {
-        let client = match self.sync_client {
-            Some(ref c) => c,
-            None => return,
-        };
-
-        let remote_state = match client.pull_state(&self.relative_path) {
-            Ok(Some(state)) => state,
-            _ => return,
-        };
-
-        let online = client.list_presence(&self.relative_path).unwrap_or_default();
-        self.online_users = online;
-
-        if let Ok(update) = yrs::Update::decode_v1(&remote_state) {
+    /// Apply a pre-pulled remote state (no I/O, fast)
+    fn apply_remote_state(&mut self, remote_state: &[u8]) {
+        if let Ok(update) = yrs::Update::decode_v1(remote_state) {
             {
                 let mut txn = self.doc.transact_mut();
                 let _ = txn.apply_update(update);
