@@ -406,3 +406,38 @@ fn test_trailing_newline_consistency() {
 
     println!("PASS: trailing newline consistency");
 }
+
+#[test]
+fn test_empty_file_init() {
+    // Simulate: new empty file, textarea has one empty line, textarea_content returns "\n"
+    let doc = Doc::new();
+    let text = doc.get_or_insert_text("content");
+
+    // textarea_content() for empty textarea returns "\n"
+    let canonical = "\n";
+    {
+        let mut txn = doc.transact_mut();
+        text.insert(&mut txn, 0, canonical);
+    }
+
+    let last = canonical.to_string();
+
+    // User types "h"
+    let new1 = "h\n";
+    sync_to_yrs(&text, &doc, &last, new1);
+    assert_eq!(get_text(&text, &doc), "h\n");
+
+    // User types more
+    sync_to_yrs(&text, &doc, new1, "hello\n");
+    assert_eq!(get_text(&text, &doc), "hello\n");
+
+    // User presses Enter
+    sync_to_yrs(&text, &doc, "hello\n", "hello\n\n");
+    assert_eq!(get_text(&text, &doc), "hello\n\n");
+
+    // User types on new line
+    sync_to_yrs(&text, &doc, "hello\n\n", "hello\nworld\n");
+    assert_eq!(get_text(&text, &doc), "hello\nworld\n");
+
+    println!("PASS: empty file init");
+}

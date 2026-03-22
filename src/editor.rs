@@ -118,39 +118,35 @@ impl Editor {
             }
         }
 
-        // Reflow for editing, then use reflowed content as the canonical form
-        // everywhere (yrs doc, textarea, last_synced_content must all agree)
+        // Reflow for editing
         let reflowed = reflow(&initial_content, MAX_WIDTH);
 
-        // Initialize yrs doc with reflowed content (same as what textarea will have)
-        {
-            let txn = doc.transact();
-            if text.get_string(&txn).is_empty() {
-                drop(txn);
-                let mut txn = doc.transact_mut();
-                text.insert(&mut txn, 0, &reflowed);
-            } else {
-                // yrs already has content from remote — sync it to reflowed form
-                drop(txn);
-                let current_yrs = {
-                    let txn = doc.transact();
-                    text.get_string(&txn)
-                };
-                if current_yrs != reflowed {
-                    sync_to_yrs(&text, &doc, &current_yrs, &reflowed);
-                }
-            }
-        }
-
+        // Create textarea first — its content format is the canonical form
         let mut textarea = TextArea::from(
             reflowed.lines().map(|l| l.to_string()).collect::<Vec<_>>(),
         );
         textarea.set_cursor_line_style(Style::default());
         textarea.set_cursor_style(Style::default());
 
-        // textarea_content() joins lines with \n and appends \n
-        // We need last_synced_content to match that exact format
-        let synced_content = textarea_content(&textarea);
+        // Get the exact string that textarea_content() will produce
+        // This is the single source of truth for content format
+        let canonical = textarea_content(&textarea);
+
+        // Initialize yrs doc to match the canonical content exactly
+        {
+            let txn = doc.transact();
+            let current_yrs = text.get_string(&txn);
+            drop(txn);
+
+            if current_yrs.is_empty() {
+                let mut txn = doc.transact_mut();
+                text.insert(&mut txn, 0, &canonical);
+            } else if current_yrs != canonical {
+                sync_to_yrs(&text, &doc, &current_yrs, &canonical);
+            }
+        }
+
+        let synced_content = canonical;
 
         let updates = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
         let updates_clone = updates.clone();
