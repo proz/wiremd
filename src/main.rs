@@ -63,6 +63,7 @@ fn run_local(path: &str) -> io::Result<()> {
     });
 
     let sync_client = try_connect();
+    let user_name = get_user_name();
 
     let relative_path = std::path::Path::new(path)
         .file_name()
@@ -75,6 +76,7 @@ fn run_local(path: &str) -> io::Result<()> {
         content,
         sync_client,
         relative_path,
+        user_name,
     );
 
     let mut terminal = setup_terminal()?;
@@ -114,6 +116,7 @@ fn run_remote_file(relative_path: &str) -> io::Result<()> {
         content,
         Some(client),
         relative_path.to_string(),
+        get_user_name(),
     );
 
     let mut terminal = setup_terminal()?;
@@ -171,6 +174,7 @@ fn run_browser() -> io::Result<()> {
                     content,
                     Some(editor_client),
                     relative_path,
+                    get_user_name(),
                 );
 
                 editor.run(&mut terminal)?;
@@ -195,6 +199,14 @@ fn try_connect() -> Option<sync::SyncClient> {
             None
         }
     }
+}
+
+fn get_user_name() -> String {
+    config::Config::load()
+        .map(|c| c.user.name)
+        .unwrap_or_else(|_| {
+            std::env::var("USER").unwrap_or_else(|_| "anonymous".to_string())
+        })
 }
 
 fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<io::Stdout>>> {

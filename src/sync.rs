@@ -1,5 +1,7 @@
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
 use std::path::Path;
+use std::sync::mpsc;
+use std::io::BufRead;
 
 use crate::config::Config;
 
@@ -240,4 +242,101 @@ impl SyncClient {
     pub fn host(&self) -> &str {
         &self.host
     }
+
+    /// Start watching a remote .yrs file for changes via inotifywait.
+    /// Returns a channel receiver that gets a message whenever the file changes,
+    /// and the child process handle (kill it when done).
+    pub fn watch_remote(
+        &self,
+        relative_path: &str,
+    ) -> Result<(mpsc::Receiver<()>, Child), String> {
+        let yrs_path = self.yrs_state_path(relative_path);
+
+        let mut child = Command::new("ssh")
+            .arg("-p").arg(self.port.to_string())
+            .arg("-o").arg("BatchMode=yes")
+            .arg("-o").arg("ServerAliveInterval=30")
+            .arg(self.ssh_dest())
+            .arg(format!(
+                "inotifywait -m -e modify,create {} 2>/dev/null || \
+                 while true; do inotifywait -e modify,create {} 2>/dev/null; done",
+                yrs_path, yrs_path
+            ))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("Failed to start inotifywait watcher: {}", e))?;
+
+        let (tx, rx) = mpsc::channel();
+
+        let stdout = child.stdout.take()
+            .ok_or("Failed to capture watcher stdout")?;
+
+        std::thread::spawn(move || {
+            let reader = std::io::BufReader::new(stdout);
+            for line in reader.lines() {
+                if line.is_ok() {
+                    // File was modified — notify the main thread
+                    if tx.send(()).is_err() {
+                        break; // receiver dropped, stop watching
+                    }
+                }
+            }
+        });
+
+        Ok((rx, child))
+    }
+
+    /// Write a presence file on the server.
+    pub fn set_presence(&self, relative_path: &str, user: &str) -> Result<(), String> {
+        let presence_dir = format!("{}/.wiremd/{}.presence", self.docs_path, relative_path);
+        let output = self.ssh_cmd()
+            .arg(format!(
+                "mkdir -p {} && echo '{}' > {}/{}",
+                presence_dir,
+                chrono_now(),
+                presence_dir,
+                user
+            ))
+            .output()
+            .map_err(|e| format!("SSH presence failed: {}", e))?;
+
+        if output.status.success() { Ok(()) } else { Err("Failed to set presence".into()) }
+    }
+
+    /// Remove presence file on the server.
+    pub fn clear_presence(&self, relative_path: &str, user: &str) -> Result<(), String> {
+        let presence_file = format!(
+            "{}/.wiremd/{}.presence/{}",
+            self.docs_path, relative_path, user
+        );
+        let _ = self.ssh_cmd()
+            .arg(format!("rm -f {}", presence_file))
+            .output();
+        Ok(())
+    }
+
+    /// List currently present users for a file.
+    pub fn list_presence(&self, relative_path: &str) -> Result<Vec<String>, String> {
+        let presence_dir = format!("{}/.wiremd/{}.presence", self.docs_path, relative_path);
+        let output = self.ssh_cmd()
+            .arg(format!("ls -1 {} 2>/dev/null || true", presence_dir))
+            .output()
+            .map_err(|e| format!("SSH ls presence failed: {}", e))?;
+
+        let users = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| l.to_string())
+            .collect();
+        Ok(users)
+    }
+}
+
+fn chrono_now() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs().to_string())
+        .unwrap_or_default()
 }

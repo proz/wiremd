@@ -1,4 +1,7 @@
 use std::io::{self, Stdout};
+use std::process::Child;
+use std::sync::mpsc;
+use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{
@@ -79,6 +82,10 @@ pub struct Editor {
     pending_updates: Vec<Vec<u8>>,
     updates: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
     _sub: yrs::Subscription,
+    watcher_rx: Option<mpsc::Receiver<()>>,
+    _watcher_child: Option<Child>,
+    user_name: String,
+    online_users: Vec<String>,
 }
 
 impl Editor {
@@ -87,6 +94,7 @@ impl Editor {
         content: String,
         sync_client: Option<SyncClient>,
         relative_path: String,
+        user_name: String,
     ) -> Self {
         let doc = Doc::new();
         let text = doc.get_or_insert_text("content");
@@ -154,6 +162,23 @@ impl Editor {
             updates_clone.lock().unwrap().push(event.update.clone());
         }).unwrap();
 
+        // Start file watcher and set presence
+        let (watcher_rx, watcher_child) = if let Some(ref client) = sync_client {
+            let _ = client.set_presence(&relative_path, &user_name);
+            match client.watch_remote(&relative_path) {
+                Ok((rx, child)) => (Some(rx), Some(child)),
+                Err(_) => (None, None),
+            }
+        } else {
+            (None, None)
+        };
+
+        let online_users = if let Some(ref client) = sync_client {
+            client.list_presence(&relative_path).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
         Self {
             path,
             relative_path,
@@ -170,35 +195,241 @@ impl Editor {
             pending_updates: Vec::new(),
             updates,
             _sub,
+            watcher_rx,
+            _watcher_child: watcher_child,
+            user_name,
+            online_users,
         }
     }
 
     pub fn run(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
         loop {
-            terminal.draw(|frame| {
-                let area = frame.area();
-                let lines = self.textarea.lines();
+            // Check for remote changes from inotifywait watcher
+            if let Some(ref rx) = self.watcher_rx {
+                if rx.try_recv().is_ok() {
+                    // Drain any extra notifications
+                    while rx.try_recv().is_ok() {}
+                    self.pull_remote_changes();
+                }
+            }
 
-                let updates_count = self.pending_updates.len();
+            self.draw(terminal)?;
+
+            // Poll with timeout so we can check the watcher channel regularly
+            if !event::poll(Duration::from_millis(200))? {
+                continue;
+            }
+
+            if let Event::Key(key) = event::read()? {
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+
+                if self.handle_key(key, terminal)? {
+                    break;
+                }
+            }
+        }
+
+        // Clean up presence on exit
+        if let Some(ref client) = self.sync_client {
+            let _ = client.clear_presence(&self.relative_path, &self.user_name);
+        }
+
+        // Kill watcher process
+        if let Some(ref mut child) = self._watcher_child {
+            let _ = child.kill();
+        }
+
+        Ok(())
+    }
+
+    /// Pull remote changes and merge into local doc
+    fn pull_remote_changes(&mut self) {
+        let client = match self.sync_client {
+            Some(ref c) => c,
+            None => return,
+        };
+
+        let remote_state = match client.pull_state(&self.relative_path) {
+            Ok(Some(state)) => state,
+            _ => return,
+        };
+
+        let online = client.list_presence(&self.relative_path).unwrap_or_default();
+        self.online_users = online;
+
+        if let Ok(update) = yrs::Update::decode_v1(&remote_state) {
+            {
+                let mut txn = self.doc.transact_mut();
+                let _ = txn.apply_update(update);
+            }
+
+            let merged = {
+                let txn = self.doc.transact();
+                self.text.get_string(&txn)
+            };
+
+            let current = textarea_content(&self.textarea);
+            if merged != current {
+                let cursor_pos = self.textarea.cursor();
+                self.reload_textarea(&merged);
+                self.textarea.move_cursor(tui_textarea::CursorMove::Jump(
+                    cursor_pos.0 as u16, cursor_pos.1 as u16,
+                ));
+                self.sync_status = "live";
+            }
+        }
+    }
+
+    /// Handle a key event. Returns true if the editor should exit.
+    fn handle_key(
+        &mut self,
+        key: crossterm::event::KeyEvent,
+        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    ) -> io::Result<bool> {
+        let display = highlight_and_wrap(self.textarea.lines(), MAX_WIDTH);
+        let total_display_lines = display.len();
+        let visible_height = terminal.size()?.height.saturating_sub(2) as usize;
+
+        match self.mode {
+            Mode::View => {
+                match key.code {
+                    KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
+                    KeyCode::Char('e') | KeyCode::Enter => {
+                        let src_line = display.display_to_source(self.view_cursor);
+                        self.textarea.move_cursor(
+                            tui_textarea::CursorMove::Jump(src_line as u16, 0),
+                        );
+                        self.mode = Mode::Edit;
+                    }
+                    KeyCode::Char('s') => {
+                        if self.modified {
+                            match self.save_and_sync() {
+                                Ok(Some(merged)) => {
+                                    self.reload_textarea(&merged);
+                                    self.sync_status = "merged";
+                                }
+                                Ok(None) => {
+                                    self.sync_status = if self.sync_client.is_some() { "synced" } else { "saved" };
+                                }
+                                Err(_) => {
+                                    self.sync_status = "sync error";
+                                }
+                            }
+                            self.modified = false;
+                        }
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        if self.view_cursor < total_display_lines.saturating_sub(1) {
+                            self.view_cursor += 1;
+                        }
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.view_cursor = self.view_cursor.saturating_sub(1);
+                    }
+                    KeyCode::PageDown | KeyCode::Char(' ') => {
+                        self.view_cursor = (self.view_cursor + visible_height)
+                            .min(total_display_lines.saturating_sub(1));
+                    }
+                    KeyCode::PageUp => {
+                        self.view_cursor = self.view_cursor.saturating_sub(visible_height);
+                    }
+                    KeyCode::Home | KeyCode::Char('g') => {
+                        self.view_cursor = 0;
+                    }
+                    KeyCode::End | KeyCode::Char('G') => {
+                        self.view_cursor = total_display_lines.saturating_sub(1);
+                    }
+                    _ => {}
+                }
+            }
+            Mode::Edit => {
+                if key.code == KeyCode::Esc {
+                    let (row, col) = self.textarea.cursor();
+                    let (dr, _) = display.source_to_display(row, col);
+                    self.view_cursor = dr;
+                    self.mode = Mode::View;
+                    return Ok(false);
+                }
+
+                if key.code == KeyCode::Char('s')
+                    && key.modifiers.contains(KeyModifiers::CONTROL)
+                {
+                    match self.save_and_sync() {
+                        Ok(Some(merged)) => {
+                            let cursor_pos = self.textarea.cursor();
+                            self.reload_textarea(&merged);
+                            self.textarea.move_cursor(tui_textarea::CursorMove::Jump(
+                                cursor_pos.0 as u16, cursor_pos.1 as u16,
+                            ));
+                            self.sync_status = "merged";
+                        }
+                        Ok(None) => {
+                            self.sync_status = if self.sync_client.is_some() { "synced" } else { "saved" };
+                        }
+                        Err(_) => {
+                            self.sync_status = "sync error";
+                        }
+                    }
+                    self.modified = false;
+                    return Ok(false);
+                }
+
+                let event = Event::Key(key);
+                if self.textarea.input(event) {
+                    self.modified = true;
+
+                    let current = textarea_content(&self.textarea);
+                    sync_to_yrs(&self.text, &self.doc, &self.last_synced_content, &current);
+                    self.last_synced_content = current;
+
+                    let mut u = self.updates.lock().unwrap();
+                    self.pending_updates.extend(u.drain(..));
+                }
+            }
+        }
+
+        Ok(false)
+    }
+
+    fn draw(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
+        let path = self.path.clone();
+        let sync_status = self.sync_status;
+        let modified = self.modified;
+        let pending_count = self.pending_updates.len();
+
+        // Build online users string
+        let users_info = if !self.online_users.is_empty() {
+            format!(" [{}]", self.online_users.join(", "))
+        } else {
+            String::new()
+        };
+
+        terminal.draw(|frame| {
+            let area = frame.area();
+            let lines = self.textarea.lines();
+
+                let updates_count = pending_count;
                 let sync_info = if updates_count > 0 {
-                    format!(" [{}|{} pending]", self.sync_status, updates_count)
+                    format!(" [{}|{} pending]", sync_status, updates_count)
                 } else {
-                    format!(" [{}]", self.sync_status)
+                    format!(" [{}]", sync_status)
                 };
 
                 let title = match self.mode {
                     Mode::View => {
-                        if self.modified {
-                            format!(" {} [modified]{} ", self.path, sync_info)
+                        if modified {
+                            format!(" {} [modified]{}{} ", path, sync_info, users_info)
                         } else {
-                            format!(" {}{} ", self.path, sync_info)
+                            format!(" {}{}{} ", path, sync_info, users_info)
                         }
                     }
                     Mode::Edit => {
-                        if self.modified {
-                            format!(" {} [editing] [modified]{} ", self.path, sync_info)
+                        if modified {
+                            format!(" {} [editing] [modified]{}{} ", path, sync_info, users_info)
                         } else {
-                            format!(" {} [editing]{} ", self.path, sync_info)
+                            format!(" {} [editing]{}{} ", path, sync_info, users_info)
                         }
                     }
                 };
@@ -217,10 +448,8 @@ impl Editor {
                 let inner = block.inner(area);
                 let visible_height = inner.height as usize;
 
-                // Highlight and wrap all lines
                 let display = highlight_and_wrap(lines, MAX_WIDTH);
 
-                // Determine cursor display position
                 let (display_cursor_line, display_cursor_col) = match self.mode {
                     Mode::View => (self.view_cursor, None),
                     Mode::Edit => {
@@ -230,7 +459,6 @@ impl Editor {
                     }
                 };
 
-                // Auto-scroll to keep cursor visible
                 if display_cursor_line < self.scroll {
                     self.scroll = display_cursor_line;
                 }
@@ -238,7 +466,6 @@ impl Editor {
                     self.scroll = display_cursor_line - visible_height + 1;
                 }
 
-                // Build visible lines with cursor highlight
                 let mut display_lines: Vec<Line> = Vec::new();
                 let content_width = inner.width as usize;
 
@@ -274,7 +501,6 @@ impl Editor {
                 let paragraph = Paragraph::new(display_lines);
                 frame.render_widget(paragraph, inner);
 
-                // Draw text cursor in edit mode
                 if let Some(col) = display_cursor_col {
                     let screen_row = display_cursor_line.saturating_sub(self.scroll) as u16;
                     let screen_col = col as u16;
@@ -286,120 +512,7 @@ impl Editor {
                         }
                     }
                 }
-            })?;
-
-            if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
-
-                let display = highlight_and_wrap(self.textarea.lines(), MAX_WIDTH);
-                let total_display_lines = display.len();
-                let visible_height = terminal.size()?.height.saturating_sub(2) as usize;
-
-                match self.mode {
-                    Mode::View => {
-                        match key.code {
-                            KeyCode::Char('q') | KeyCode::Esc => break,
-                            KeyCode::Char('e') | KeyCode::Enter => {
-                                let src_line = display.display_to_source(self.view_cursor);
-                                self.textarea.move_cursor(tui_textarea::CursorMove::Jump(
-                                    src_line as u16,
-                                    0,
-                                ));
-                                self.mode = Mode::Edit;
-                            }
-                            KeyCode::Char('s') => {
-                                if self.modified {
-                                    match self.save_and_sync() {
-                                        Ok(Some(merged)) => {
-                                            self.reload_textarea(&merged);
-                                            self.sync_status = "merged";
-                                        }
-                                        Ok(None) => {
-                                            self.sync_status = if self.sync_client.is_some() { "synced" } else { "saved" };
-                                        }
-                                        Err(_e) => {
-                                            self.sync_status = "sync error";
-                                        }
-                                    }
-                                    self.modified = false;
-                                }
-                            }
-                            KeyCode::Down | KeyCode::Char('j') => {
-                                if self.view_cursor < total_display_lines.saturating_sub(1) {
-                                    self.view_cursor += 1;
-                                }
-                            }
-                            KeyCode::Up | KeyCode::Char('k') => {
-                                self.view_cursor = self.view_cursor.saturating_sub(1);
-                            }
-                            KeyCode::PageDown | KeyCode::Char(' ') => {
-                                self.view_cursor = (self.view_cursor + visible_height)
-                                    .min(total_display_lines.saturating_sub(1));
-                            }
-                            KeyCode::PageUp => {
-                                self.view_cursor = self.view_cursor.saturating_sub(visible_height);
-                            }
-                            KeyCode::Home | KeyCode::Char('g') => {
-                                self.view_cursor = 0;
-                            }
-                            KeyCode::End | KeyCode::Char('G') => {
-                                self.view_cursor = total_display_lines.saturating_sub(1);
-                            }
-                            _ => {}
-                        }
-                    }
-                    Mode::Edit => {
-                        if key.code == KeyCode::Esc {
-                            let (row, col) = self.textarea.cursor();
-                            let (dr, _) = display.source_to_display(row, col);
-                            self.view_cursor = dr;
-                            self.mode = Mode::View;
-                            continue;
-                        }
-
-                        if key.code == KeyCode::Char('s')
-                            && key.modifiers.contains(KeyModifiers::CONTROL)
-                        {
-                            match self.save_and_sync() {
-                                Ok(Some(merged)) => {
-                                    let cursor_pos = self.textarea.cursor();
-                                    self.reload_textarea(&merged);
-                                    self.textarea.move_cursor(tui_textarea::CursorMove::Jump(
-                                        cursor_pos.0 as u16, cursor_pos.1 as u16,
-                                    ));
-                                    self.sync_status = "merged";
-                                }
-                                Ok(None) => {
-                                    self.sync_status = if self.sync_client.is_some() { "synced" } else { "saved" };
-                                }
-                                Err(_) => {
-                                    self.sync_status = "sync error";
-                                }
-                            }
-                            self.modified = false;
-                            continue;
-                        }
-
-                        let event = Event::Key(key);
-                        if self.textarea.input(event) {
-                            self.modified = true;
-
-                            // Sync textarea content to yrs doc (raw, no unreflow)
-                            let current = textarea_content(&self.textarea);
-                            sync_to_yrs(&self.text, &self.doc, &self.last_synced_content, &current);
-                            self.last_synced_content = current;
-
-                            // Collect any pending updates
-                            let mut u = self.updates.lock().unwrap();
-                            self.pending_updates.extend(u.drain(..));
-                        }
-                    }
-                }
-            }
-        }
-
+        })?;
         Ok(())
     }
 
