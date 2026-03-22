@@ -10,7 +10,7 @@ use ratatui::{
 };
 use similar::{ChangeTag, TextDiff};
 use tui_textarea::TextArea;
-use yrs::{Doc, GetString, Text, TextRef, Transact, updates::decoder::Decode};
+use yrs::{Doc, GetString, ReadTxn, Text, TextRef, Transact, updates::decoder::Decode};
 
 use crate::sync::SyncClient;
 
@@ -373,71 +373,65 @@ impl Editor {
         Ok(())
     }
 
-    /// Full save + sync flow:
-    /// 1. Push local yrs updates to server
-    /// 2. Pull remote yrs updates (other users' changes)
-    /// 3. Apply remote updates to local yrs doc (CRDT auto-merge)
+    /// Full save + sync flow using yrs state snapshots (not individual updates).
+    /// 1. Sync local edits to yrs doc
+    /// 2. Pull remote yrs state from server
+    /// 3. Merge remote state into local doc (CRDT auto-merge, idempotent)
     /// 4. Get merged text from yrs doc
     /// 5. Write merged text locally
-    /// 6. Push merged file to server
-    /// 7. Clear applied updates
-    /// Returns the merged content if it changed, so the caller can update the textarea.
+    /// 6. Push local yrs state to server (full snapshot)
+    /// 7. Push merged markdown file to server
     fn save_and_sync(&mut self) -> Result<Option<String>, String> {
-        // First, make sure local edits are synced to yrs
+        // Sync local edits to yrs
         let local_content = unreflow(&textarea_content(&self.textarea));
         sync_to_yrs(&self.text, &self.doc, &self.last_synced_content, &local_content);
         self.last_synced_content = local_content.clone();
 
-        // Drain any observer updates into pending
+        // Drain observer updates (we track them but use state snapshots for sync)
         {
             let mut u = self.updates.lock().unwrap();
             self.pending_updates.extend(u.drain(..));
         }
 
         if let Some(ref client) = self.sync_client {
-            // 1. Push our updates to server
-            if !self.pending_updates.is_empty() {
-                client.push_updates(&self.relative_path, &self.pending_updates)
-                    .map_err(|e| format!("Push updates failed: {}", e))?;
-            }
+            let before_merge = local_content.clone();
 
-            // 2. Pull remote updates from server
-            let remote_updates = client.pull_updates(&self.relative_path)
-                .unwrap_or_default();
-
-            // 3. Apply remote updates to local yrs doc
-            let had_remote = !remote_updates.is_empty();
-            for update_data in &remote_updates {
-                if let Ok(update) = yrs::Update::decode_v1(update_data) {
+            // 1. Pull remote yrs state snapshot
+            if let Ok(Some(remote_state)) = client.pull_state(&self.relative_path) {
+                // 2. Merge remote state into local doc
+                if let Ok(update) = yrs::Update::decode_v1(&remote_state) {
                     let mut txn = self.doc.transact_mut();
-                    txn.apply_update(update)
-                        .unwrap_or_else(|e| eprintln!("Failed to apply remote update: {}", e));
+                    let _ = txn.apply_update(update);
                 }
             }
 
-            // 4. Get merged content from yrs doc
+            // 3. Get merged content from yrs doc
             let merged = {
                 let txn = self.doc.transact();
                 self.text.get_string(&txn)
             };
 
-            // 5. Write merged text locally
+            // 4. Write merged text locally
             std::fs::write(&self.path, &merged)
                 .map_err(|e| format!("Failed to write file: {}", e))?;
 
-            // 6. Push merged file to server
+            // 5. Push our full yrs state to server (snapshot, not deltas)
+            let state = {
+                let txn = self.doc.transact();
+                txn.encode_state_as_update_v1(&yrs::StateVector::default())
+            };
+            client.push_state(&self.relative_path, &state)
+                .map_err(|e| format!("Push state failed: {}", e))?;
+
+            // 6. Push merged markdown file to server
             client.push_file(&self.relative_path, &merged)
                 .map_err(|e| format!("Push file failed: {}", e))?;
-
-            // 7. Clear applied updates from server
-            client.clear_updates(&self.relative_path)
-                .unwrap_or_else(|e| eprintln!("Failed to clear remote updates: {}", e));
 
             self.pending_updates.clear();
             self.last_synced_content = merged.clone();
 
-            // Return merged content if remote changes were applied
-            if had_remote {
+            // Return merged content if it changed (remote had different edits)
+            if merged != before_merge {
                 Ok(Some(merged))
             } else {
                 Ok(None)
