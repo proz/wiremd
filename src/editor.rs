@@ -88,34 +88,56 @@ impl Editor {
         sync_client: Option<SyncClient>,
         relative_path: String,
     ) -> Self {
-        let reflowed = reflow(&content, MAX_WIDTH);
-        let mut textarea = TextArea::from(reflowed.lines());
-        textarea.set_cursor_line_style(Style::default());
-        textarea.set_cursor_style(Style::default());
-
         let doc = Doc::new();
         let text = doc.get_or_insert_text("content");
-        {
-            let mut txn = doc.transact_mut();
-            text.insert(&mut txn, 0, &content);
+
+        let mut sync_status: &'static str = if sync_client.is_some() {
+            "connected"
+        } else {
+            "offline"
+        };
+
+        // Try to pull existing yrs state from server (so all clients share the same base)
+        let mut initial_content = content.clone();
+        if let Some(ref client) = sync_client {
+            let _ = client.ensure_remote_dirs(&relative_path);
+
+            if let Ok(Some(remote_state)) = client.pull_state(&relative_path) {
+                if let Ok(update) = yrs::Update::decode_v1(&remote_state) {
+                    let mut txn = doc.transact_mut();
+                    let _ = txn.apply_update(update);
+                    let txn2 = doc.transact();
+                    let remote_content = text.get_string(&txn2);
+                    if !remote_content.is_empty() {
+                        initial_content = remote_content;
+                        sync_status = "synced";
+                    }
+                }
+            }
         }
+
+        // If no remote state, initialize yrs doc from local content
+        {
+            let txn = doc.transact();
+            if text.get_string(&txn).is_empty() {
+                drop(txn);
+                let mut txn = doc.transact_mut();
+                text.insert(&mut txn, 0, &initial_content);
+            }
+        }
+
+        let reflowed = reflow(&initial_content, MAX_WIDTH);
+        let mut textarea = TextArea::from(
+            reflowed.lines().map(|l| l.to_string()).collect::<Vec<_>>(),
+        );
+        textarea.set_cursor_line_style(Style::default());
+        textarea.set_cursor_style(Style::default());
 
         let updates = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
         let updates_clone = updates.clone();
         let _sub = doc.observe_update_v1(move |_txn, event| {
             updates_clone.lock().unwrap().push(event.update.clone());
         }).unwrap();
-
-        let sync_status = if sync_client.is_some() {
-            "connected"
-        } else {
-            "offline"
-        };
-
-        // Initial pull from server
-        if let Some(ref client) = sync_client {
-            let _ = client.ensure_remote_dirs(&relative_path);
-        }
 
         Self {
             path,
@@ -129,7 +151,7 @@ impl Editor {
             modified: false,
             sync_status,
             sync_client,
-            last_synced_content: content,
+            last_synced_content: initial_content,
             pending_updates: Vec::new(),
             updates,
             _sub,
@@ -276,11 +298,7 @@ impl Editor {
                                 if self.modified {
                                     match self.save_and_sync() {
                                         Ok(Some(merged)) => {
-                                            // Remote changes merged -- reload textarea
-                                            let reflowed = reflow(&merged, MAX_WIDTH);
-                                            self.textarea = TextArea::from(reflowed.lines());
-                                            self.textarea.set_cursor_line_style(Style::default());
-                                            self.textarea.set_cursor_style(Style::default());
+                                            self.reload_textarea(&merged);
                                             self.sync_status = "merged";
                                         }
                                         Ok(None) => {
@@ -332,10 +350,7 @@ impl Editor {
                             match self.save_and_sync() {
                                 Ok(Some(merged)) => {
                                     let cursor_pos = self.textarea.cursor();
-                                    let reflowed = reflow(&merged, MAX_WIDTH);
-                                    self.textarea = TextArea::from(reflowed.lines());
-                                    self.textarea.set_cursor_line_style(Style::default());
-                                    self.textarea.set_cursor_style(Style::default());
+                                    self.reload_textarea(&merged);
                                     self.textarea.move_cursor(tui_textarea::CursorMove::Jump(
                                         cursor_pos.0 as u16, cursor_pos.1 as u16,
                                     ));
@@ -356,8 +371,8 @@ impl Editor {
                         if self.textarea.input(event) {
                             self.modified = true;
 
-                            // Sync textarea content to yrs doc
-                            let current = unreflow(&textarea_content(&self.textarea));
+                            // Sync textarea content to yrs doc (raw, no unreflow)
+                            let current = textarea_content(&self.textarea);
                             sync_to_yrs(&self.text, &self.doc, &self.last_synced_content, &current);
                             self.last_synced_content = current;
 
@@ -381,24 +396,31 @@ impl Editor {
     /// 5. Write merged text locally
     /// 6. Push local yrs state to server (full snapshot)
     /// 7. Push merged markdown file to server
+    /// Reload the textarea with new content, preserving cursor style
+    fn reload_textarea(&mut self, content: &str) {
+        self.textarea = TextArea::from(
+            content.lines().map(|l| l.to_string()).collect::<Vec<_>>(),
+        );
+        self.textarea.set_cursor_line_style(Style::default());
+        self.textarea.set_cursor_style(Style::default());
+    }
+
     fn save_and_sync(&mut self) -> Result<Option<String>, String> {
-        // Sync local edits to yrs
-        let local_content = unreflow(&textarea_content(&self.textarea));
+        // Sync local edits to yrs (raw content, no unreflow)
+        let local_content = textarea_content(&self.textarea);
         sync_to_yrs(&self.text, &self.doc, &self.last_synced_content, &local_content);
         self.last_synced_content = local_content.clone();
 
-        // Drain observer updates (we track them but use state snapshots for sync)
+        // Drain observer updates
         {
             let mut u = self.updates.lock().unwrap();
             self.pending_updates.extend(u.drain(..));
         }
 
         if let Some(ref client) = self.sync_client {
-            let before_merge = local_content.clone();
-
             // 1. Pull remote yrs state snapshot
             if let Ok(Some(remote_state)) = client.pull_state(&self.relative_path) {
-                // 2. Merge remote state into local doc
+                // 2. Merge remote state into local doc (CRDT auto-merge)
                 if let Ok(update) = yrs::Update::decode_v1(&remote_state) {
                     let mut txn = self.doc.transact_mut();
                     let _ = txn.apply_update(update);
@@ -415,7 +437,7 @@ impl Editor {
             std::fs::write(&self.path, &merged)
                 .map_err(|e| format!("Failed to write file: {}", e))?;
 
-            // 5. Push our full yrs state to server (snapshot, not deltas)
+            // 5. Push our full yrs state to server (snapshot)
             let state = {
                 let txn = self.doc.transact();
                 txn.encode_state_as_update_v1(&yrs::StateVector::default())
@@ -428,10 +450,12 @@ impl Editor {
                 .map_err(|e| format!("Push file failed: {}", e))?;
 
             self.pending_updates.clear();
+
+            // Compare merged content with what we had locally
+            let changed = merged != local_content;
             self.last_synced_content = merged.clone();
 
-            // Return merged content if it changed (remote had different edits)
-            if merged != before_merge {
+            if changed {
                 Ok(Some(merged))
             } else {
                 Ok(None)
@@ -616,11 +640,13 @@ fn sync_to_yrs(text: &TextRef, doc: &Doc, old: &str, new: &str) {
         return;
     }
 
-    let diff = TextDiff::from_chars(old, new);
+    // Diff line by line first, then char-level within changed lines.
+    // This handles newline insertions/deletions correctly.
+    let line_diff = TextDiff::from_lines(old, new);
     let mut txn = doc.transact_mut();
     let mut pos: u32 = 0;
 
-    for change in diff.iter_all_changes() {
+    for change in line_diff.iter_all_changes() {
         match change.tag() {
             ChangeTag::Equal => {
                 pos += change.value().len() as u32;
