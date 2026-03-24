@@ -87,6 +87,12 @@ pub struct Editor {
     user_name: String,
     online_users: Vec<String>,
     last_save: Instant,
+    last_edit: Instant,
+    confirm_exit: bool,
+    // Cached display — only recomputed when content changes
+    cached_display: Option<DisplayMap>,
+    content_generation: u64,
+    cached_generation: u64,
 }
 
 impl Editor {
@@ -106,9 +112,10 @@ impl Editor {
             "offline"
         };
 
-        // Try to pull existing yrs state from server (so all clients share the same base)
+        // Start persistent SSH connection and pull initial state
         let mut initial_content = content.clone();
         if let Some(ref client) = sync_client {
+            let _ = client.start_control_master();
             let _ = client.ensure_remote_dirs(&relative_path);
 
             if let Ok(Some(remote_state)) = client.pull_state(&relative_path) {
@@ -201,14 +208,48 @@ impl Editor {
             user_name,
             online_users,
             last_save: Instant::now(),
+            last_edit: Instant::now(),
+            confirm_exit: false,
+            cached_display: None,
+            content_generation: 0,
+            cached_generation: u64::MAX, // force initial compute
         }
     }
 
     pub fn run(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
-        let autosave_interval = Duration::from_secs(3);
+        // Debounced save: save 500ms after last edit (not on a fixed timer)
+        let debounce = Duration::from_millis(500);
 
         loop {
-            // Check for remote changes (pre-pulled by background thread)
+            self.draw(terminal)?;
+
+            // Smart timeout: if we have pending edits, wake up when debounce expires
+            // Otherwise block indefinitely waiting for input
+            let timeout = if self.modified {
+                let since_edit = self.last_edit.elapsed();
+                if since_edit >= debounce {
+                    Duration::ZERO // save immediately
+                } else {
+                    debounce - since_edit
+                }
+            } else if self.watcher_rx.is_some() {
+                Duration::from_millis(500) // check watcher periodically
+            } else {
+                Duration::from_secs(60) // idle, block long
+            };
+
+            if event::poll(timeout)? {
+                if let Event::Key(key) = event::read()? {
+                    if key.kind != KeyEventKind::Press {
+                        continue;
+                    }
+                    if self.handle_key(key, terminal)? {
+                        return self.cleanup();
+                    }
+                }
+            }
+
+            // Check for remote changes (non-blocking)
             if let Some(ref rx) = self.watcher_rx {
                 let mut latest_state: Option<Vec<u8>> = None;
                 while let Ok(state) = rx.try_recv() {
@@ -219,52 +260,37 @@ impl Editor {
                 }
             }
 
-            // Auto-save when modified and enough time has passed
-            if self.modified && self.last_save.elapsed() >= autosave_interval {
+            // Debounced auto-save: save 500ms after last keystroke
+            if self.modified && self.last_edit.elapsed() >= debounce {
                 self.do_autosave();
             }
-
-            self.draw(terminal)?;
-
-            if !event::poll(Duration::from_millis(200))? {
-                continue;
-            }
-
-            if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
-
-                if self.handle_key(key, terminal)? {
-                    break;
-                }
-            }
         }
+    }
 
-        // Save on exit if modified
+    fn cleanup(&mut self) -> io::Result<()> {
         if self.modified {
             self.do_autosave();
         }
-
-        // Clean up presence on exit
         if let Some(ref client) = self.sync_client {
             let _ = client.clear_presence(&self.relative_path, &self.user_name);
+            client.stop_control_master();
         }
-
-        // Kill watcher process
         if let Some(ref mut child) = self._watcher_child {
             let _ = child.kill();
         }
-
         Ok(())
     }
 
     /// Auto-save: sync to yrs, write locally (fast), push to server in background thread
     fn do_autosave(&mut self) {
-        // 1. Sync textarea to yrs (in-memory, fast)
+        // 1. Sync textarea to yrs (in-memory)
         let local_content = textarea_content(&self.textarea);
-        sync_to_yrs(&self.text, &self.doc, &self.last_synced_content, &local_content);
-        self.last_synced_content = local_content.clone();
+        let sync_ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            sync_to_yrs(&self.text, &self.doc, &self.last_synced_content, &local_content);
+        }));
+        if sync_ok.is_ok() {
+            self.last_synced_content = local_content.clone();
+        }
 
         // Drain observer updates
         {
@@ -272,7 +298,7 @@ impl Editor {
             self.pending_updates.extend(u.drain(..));
         }
 
-        // 2. Write locally (fast)
+        // 2. Write locally
         let _ = std::fs::write(&self.path, &local_content);
 
         // 3. Push to server in background (non-blocking)
@@ -282,43 +308,47 @@ impl Editor {
                 txn.encode_state_as_update_v1(&yrs::StateVector::default())
             };
 
-            // Spawn background thread for SSH push
+            // Spawn background thread for SSH push (reuses ControlMaster)
             let host = client.host().to_string();
             let ssh_user = client.ssh_user().to_string();
             let port = client.port();
             let docs_path = client.docs_path().to_string();
             let relative_path = self.relative_path.clone();
             let content = local_content.clone();
+            let control_path = client.control_path().to_string();
+            let pid = std::process::id();
 
             std::thread::spawn(move || {
-                // Push yrs state
                 let yrs_remote = format!(
                     "{}@{}:{}/.wiremd/{}.yrs",
                     ssh_user, host, docs_path, relative_path
                 );
-                let tmp_state = std::env::temp_dir().join("wiremd_autosave_state");
+                let tmp_state = std::env::temp_dir().join(format!("wiremd_autosave_state_{}", pid));
                 if std::fs::write(&tmp_state, &state).is_ok() {
                     let _ = std::process::Command::new("scp")
+                        .stdin(std::process::Stdio::null())
                         .arg("-P").arg(port.to_string())
                         .arg("-o").arg("BatchMode=yes")
-                        .arg("-o").arg("ConnectTimeout=5")
+                        .arg("-o").arg(format!("ControlPath={}", control_path))
+                        .arg("-o").arg("ControlMaster=auto")
                         .arg(tmp_state.to_str().unwrap())
                         .arg(&yrs_remote)
                         .output();
                     let _ = std::fs::remove_file(&tmp_state);
                 }
 
-                // Push markdown file
                 let file_remote = format!(
                     "{}@{}:{}/{}",
                     ssh_user, host, docs_path, relative_path
                 );
-                let tmp_file = std::env::temp_dir().join("wiremd_autosave_file");
+                let tmp_file = std::env::temp_dir().join(format!("wiremd_autosave_file_{}", pid));
                 if std::fs::write(&tmp_file, &content).is_ok() {
                     let _ = std::process::Command::new("scp")
+                        .stdin(std::process::Stdio::null())
                         .arg("-P").arg(port.to_string())
                         .arg("-o").arg("BatchMode=yes")
-                        .arg("-o").arg("ConnectTimeout=5")
+                        .arg("-o").arg(format!("ControlPath={}", control_path))
+                        .arg("-o").arg("ControlMaster=auto")
                         .arg(tmp_file.to_str().unwrap())
                         .arg(&file_remote)
                         .output();
@@ -336,12 +366,42 @@ impl Editor {
         self.last_save = Instant::now();
     }
 
-    /// Apply a pre-pulled remote state (no I/O, fast)
+    /// Get or recompute the cached display. Only recomputes if content changed.
+    fn get_display(&mut self) -> &DisplayMap {
+        if self.cached_generation != self.content_generation || self.cached_display.is_none() {
+            self.cached_display = Some(highlight_and_wrap(self.textarea.lines(), MAX_WIDTH));
+            self.cached_generation = self.content_generation;
+        }
+        self.cached_display.as_ref().unwrap()
+    }
+
+    /// Mark content as changed so the display cache is invalidated.
+    fn invalidate_display(&mut self) {
+        self.content_generation = self.content_generation.wrapping_add(1);
+    }
+
+    /// Apply a pre-pulled remote state (no I/O, fast).
+    /// First syncs local edits to yrs so they're not lost during merge.
     fn apply_remote_state(&mut self, remote_state: &[u8]) {
+        // Sync current textarea to yrs first, so local edits are preserved
+        let current = textarea_content(&self.textarea);
+        // Use catch_unwind to prevent yrs panics from crashing the app
+        let sync_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            sync_to_yrs(&self.text, &self.doc, &self.last_synced_content, &current);
+        }));
+        if sync_result.is_ok() {
+            self.last_synced_content = current.clone();
+        }
+
+        // Apply remote state on top
         if let Ok(update) = yrs::Update::decode_v1(remote_state) {
-            {
+            let apply_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let mut txn = self.doc.transact_mut();
                 let _ = txn.apply_update(update);
+            }));
+
+            if apply_result.is_err() {
+                return; // corrupted state, skip
             }
 
             let merged = {
@@ -349,7 +409,6 @@ impl Editor {
                 self.text.get_string(&txn)
             };
 
-            let current = textarea_content(&self.textarea);
             if merged != current {
                 let cursor_pos = self.textarea.cursor();
                 self.reload_textarea(&merged);
@@ -357,6 +416,7 @@ impl Editor {
                     cursor_pos.0 as u16, cursor_pos.1 as u16,
                 ));
                 self.sync_status = "live";
+                self.invalidate_display();
             }
         }
     }
@@ -367,16 +427,30 @@ impl Editor {
         key: crossterm::event::KeyEvent,
         terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     ) -> io::Result<bool> {
-        let display = highlight_and_wrap(self.textarea.lines(), MAX_WIDTH);
-        let total_display_lines = display.len();
+        self.get_display(); // ensure cache is fresh
+        let total_display_lines = self.cached_display.as_ref().unwrap().len();
         let visible_height = terminal.size()?.height.saturating_sub(2) as usize;
+
+        // Handle exit confirmation
+        if self.confirm_exit {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Enter => return Ok(true),
+                _ => {
+                    self.confirm_exit = false;
+                    return Ok(false);
+                }
+            }
+        }
 
         match self.mode {
             Mode::View => {
                 match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
+                    KeyCode::Char('q') | KeyCode::Esc => {
+                        self.confirm_exit = true;
+                        return Ok(false);
+                    }
                     KeyCode::Char('e') | KeyCode::Enter => {
-                        let src_line = display.display_to_source(self.view_cursor);
+                        let src_line = self.cached_display.as_ref().unwrap().display_to_source(self.view_cursor);
                         self.textarea.move_cursor(
                             tui_textarea::CursorMove::Jump(src_line as u16, 0),
                         );
@@ -409,7 +483,7 @@ impl Editor {
             Mode::Edit => {
                 if key.code == KeyCode::Esc {
                     let (row, col) = self.textarea.cursor();
-                    let (dr, _) = display.source_to_display(row, col);
+                    let (dr, _) = self.cached_display.as_ref().unwrap().source_to_display(row, col);
                     self.view_cursor = dr;
                     self.mode = Mode::View;
                     return Ok(false);
@@ -418,6 +492,8 @@ impl Editor {
                 let event = Event::Key(key);
                 if self.textarea.input(event) {
                     self.modified = true;
+                    self.last_edit = Instant::now();
+                    self.invalidate_display();
                 }
             }
         }
@@ -426,124 +502,106 @@ impl Editor {
     }
 
     fn draw(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
-        let path = self.path.clone();
-        let sync_status = self.sync_status;
-        let modified = self.modified;
-        let pending_count = self.pending_updates.len();
+        // Ensure display cache is fresh
+        self.get_display();
 
-        // Build online users string
-        let users_info = if !self.online_users.is_empty() {
-            format!(" [{}]", self.online_users.join(", "))
+        let display = self.cached_display.as_ref().unwrap();
+
+        let (display_cursor_line, display_cursor_col) = match self.mode {
+            Mode::View => (self.view_cursor, None),
+            Mode::Edit => {
+                let (row, col) = self.textarea.cursor();
+                let (dr, dc) = display.source_to_display(row, col);
+                (dr, Some(dc))
+            }
+        };
+
+        let title = match (&self.mode, self.modified) {
+            (Mode::View, false) => format!(" {} [{}] ", self.path, self.sync_status),
+            (Mode::View, true) => format!(" {} [modified] [{}] ", self.path, self.sync_status),
+            (Mode::Edit, false) => format!(" {} [EDITING] [{}] ", self.path, self.sync_status),
+            (Mode::Edit, true) => format!(" {} [EDITING] [modified] [{}] ", self.path, self.sync_status),
+        };
+
+        let bottom = if self.confirm_exit {
+            " Quit? y/Enter: yes │ any key: cancel "
         } else {
-            String::new()
+            match self.mode {
+                Mode::View => " e: edit │ q: quit ",
+                Mode::Edit => " Esc: view │ auto-saving ",
+            }
+        };
+
+        let border_color = if self.confirm_exit {
+            Color::Red
+        } else {
+            match self.mode {
+                Mode::View => Color::DarkGray,
+                Mode::Edit => Color::Yellow,
+            }
         };
 
         terminal.draw(|frame| {
             let area = frame.area();
-            let lines = self.textarea.lines();
 
-                let updates_count = pending_count;
-                let sync_info = if updates_count > 0 {
-                    format!(" [{}|{} pending]", sync_status, updates_count)
+            let block = Block::default()
+                .title(title.as_str())
+                .title_bottom(bottom)
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(border_color));
+
+            let inner = block.inner(area);
+            let visible_height = inner.height as usize;
+
+            if display_cursor_line < self.scroll {
+                self.scroll = display_cursor_line;
+            }
+            if display_cursor_line >= self.scroll + visible_height {
+                self.scroll = display_cursor_line - visible_height + 1;
+            }
+
+            let content_width = inner.width as usize;
+            let display = self.cached_display.as_ref().unwrap();
+            let mut visible_lines: Vec<Line> = Vec::with_capacity(visible_height);
+
+            for (i, line) in display.lines.iter().enumerate().skip(self.scroll).take(visible_height) {
+                if i == display_cursor_line {
+                    let cursor_bg = Color::Rgb(40, 40, 55);
+                    let mut spans: Vec<Span<'static>> = line
+                        .spans
+                        .iter()
+                        .map(|span| {
+                            Span::styled(span.content.to_string(), span.style.bg(cursor_bg))
+                        })
+                        .collect();
+                    let text_len: usize = spans.iter().map(|s| s.content.len()).sum();
+                    if text_len < content_width {
+                        spans.push(Span::styled(
+                            " ".repeat(content_width - text_len),
+                            Style::default().bg(cursor_bg),
+                        ));
+                    }
+                    visible_lines.push(Line::from(spans));
                 } else {
-                    format!(" [{}]", sync_status)
-                };
-
-                let title = match self.mode {
-                    Mode::View => {
-                        if modified {
-                            format!(" {} [modified]{}{} ", path, sync_info, users_info)
-                        } else {
-                            format!(" {}{}{} ", path, sync_info, users_info)
-                        }
-                    }
-                    Mode::Edit => {
-                        if modified {
-                            format!(" {} [editing] [modified]{}{} ", path, sync_info, users_info)
-                        } else {
-                            format!(" {} [editing]{}{} ", path, sync_info, users_info)
-                        }
-                    }
-                };
-
-                let bottom = match self.mode {
-                    Mode::View => " e: edit │ q: quit ",
-                    Mode::Edit => " Esc: view │ auto-saving ",
-                };
-
-                let block = Block::default()
-                    .title(title)
-                    .title_bottom(bottom)
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::DarkGray));
-
-                let inner = block.inner(area);
-                let visible_height = inner.height as usize;
-
-                let display = highlight_and_wrap(lines, MAX_WIDTH);
-
-                let (display_cursor_line, display_cursor_col) = match self.mode {
-                    Mode::View => (self.view_cursor, None),
-                    Mode::Edit => {
-                        let (row, col) = self.textarea.cursor();
-                        let (dr, dc) = display.source_to_display(row, col);
-                        (dr, Some(dc))
-                    }
-                };
-
-                if display_cursor_line < self.scroll {
-                    self.scroll = display_cursor_line;
+                    visible_lines.push(line.clone());
                 }
-                if display_cursor_line >= self.scroll + visible_height {
-                    self.scroll = display_cursor_line - visible_height + 1;
-                }
+            }
 
-                let mut display_lines: Vec<Line> = Vec::new();
-                let content_width = inner.width as usize;
+            frame.render_widget(block, area);
+            frame.render_widget(Paragraph::new(visible_lines), inner);
 
-                for (i, line) in display.lines.iter().enumerate().skip(self.scroll).take(visible_height) {
-                    if i == display_cursor_line {
-                        let cursor_bg = Color::Rgb(40, 40, 55);
-                        let mut spans: Vec<Span<'static>> = line
-                            .spans
-                            .iter()
-                            .map(|span| {
-                                Span::styled(
-                                    span.content.to_string(),
-                                    span.style.bg(cursor_bg),
-                                )
-                            })
-                            .collect();
-
-                        let text_len: usize = spans.iter().map(|s| s.content.len()).sum();
-                        if text_len < content_width {
-                            spans.push(Span::styled(
-                                " ".repeat(content_width - text_len),
-                                Style::default().bg(cursor_bg),
-                            ));
-                        }
-
-                        display_lines.push(Line::from(spans));
-                    } else {
-                        display_lines.push(line.clone());
+            // Draw text cursor in edit mode
+            if let Some(col) = display_cursor_col {
+                let screen_row = display_cursor_line.saturating_sub(self.scroll) as u16;
+                let screen_col = col as u16;
+                if screen_row < inner.height && screen_col < inner.width {
+                    let cx = inner.x + screen_col;
+                    let cy = inner.y + screen_row;
+                    if let Some(cell) = frame.buffer_mut().cell_mut((cx, cy)) {
+                        cell.set_style(Style::default().add_modifier(Modifier::REVERSED));
                     }
                 }
-
-                frame.render_widget(block, area);
-                let paragraph = Paragraph::new(display_lines);
-                frame.render_widget(paragraph, inner);
-
-                if let Some(col) = display_cursor_col {
-                    let screen_row = display_cursor_line.saturating_sub(self.scroll) as u16;
-                    let screen_col = col as u16;
-                    if screen_row < inner.height && screen_col < inner.width {
-                        let cx = inner.x + screen_col;
-                        let cy = inner.y + screen_row;
-                        if let Some(cell) = frame.buffer_mut().cell_mut((cx, cy)) {
-                            cell.set_style(Style::default().add_modifier(Modifier::REVERSED));
-                        }
-                    }
-                }
+            }
         })?;
         Ok(())
     }
@@ -563,8 +621,8 @@ impl Editor {
         );
         self.textarea.set_cursor_line_style(Style::default());
         self.textarea.set_cursor_style(Style::default());
-        // Keep last_synced_content in sync with textarea_content()
         self.last_synced_content = textarea_content(&self.textarea);
+        self.invalidate_display();
     }
 
 }

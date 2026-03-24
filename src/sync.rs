@@ -15,16 +15,62 @@ pub struct SyncClient {
     ssh_user: String,
     port: u16,
     docs_path: String,
+    control_path: String,
 }
 
 impl SyncClient {
     pub fn new(config: &Config) -> Self {
+        let control_path = format!(
+            "/tmp/wiremd_ssh_{}_{}_{}",
+            config.server.ssh_user, config.server.host, std::process::id()
+        );
         Self {
             host: config.server.host.clone(),
             ssh_user: config.server.ssh_user.clone(),
             port: config.server.port,
             docs_path: config.server.docs_path.clone(),
+            control_path,
         }
+    }
+
+    /// Start a persistent SSH ControlMaster connection.
+    /// All subsequent ssh/scp commands reuse it (no handshake overhead).
+    pub fn start_control_master(&self) -> Result<(), String> {
+        let output = Command::new("ssh")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .arg("-p").arg(self.port.to_string())
+            .arg("-o").arg("BatchMode=yes")
+            .arg("-o").arg("ConnectTimeout=5")
+            .arg("-o").arg(format!("ControlPath={}", self.control_path))
+            .arg("-o").arg("ControlMaster=yes")
+            .arg("-o").arg("ControlPersist=600")
+            .arg("-fN") // background, no command
+            .arg(self.ssh_dest())
+            .output()
+            .map_err(|e| format!("Failed to start ControlMaster: {}", e))?;
+
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "ControlMaster failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ))
+        }
+    }
+
+    /// Stop the persistent SSH ControlMaster connection.
+    pub fn stop_control_master(&self) {
+        let _ = Command::new("ssh")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .arg("-o").arg(format!("ControlPath={}", self.control_path))
+            .arg("-O").arg("exit")
+            .arg(self.ssh_dest())
+            .output();
     }
 
     fn ssh_dest(&self) -> String {
@@ -33,18 +79,24 @@ impl SyncClient {
 
     fn ssh_cmd(&self) -> Command {
         let mut cmd = Command::new("ssh");
+        cmd.stdin(Stdio::null());
         cmd.arg("-p").arg(self.port.to_string());
         cmd.arg("-o").arg("BatchMode=yes");
         cmd.arg("-o").arg("ConnectTimeout=5");
+        cmd.arg("-o").arg(format!("ControlPath={}", self.control_path));
+        cmd.arg("-o").arg("ControlMaster=auto");
         cmd.arg(self.ssh_dest());
         cmd
     }
 
     fn scp_cmd(&self) -> Command {
         let mut cmd = Command::new("scp");
+        cmd.stdin(Stdio::null());
         cmd.arg("-P").arg(self.port.to_string());
         cmd.arg("-o").arg("BatchMode=yes");
         cmd.arg("-o").arg("ConnectTimeout=5");
+        cmd.arg("-o").arg(format!("ControlPath={}", self.control_path));
+        cmd.arg("-o").arg("ControlMaster=auto");
         cmd
     }
 
@@ -101,7 +153,7 @@ impl SyncClient {
             self.yrs_state_path(relative_path)
         );
 
-        let tmp = std::env::temp_dir().join("wiremd_state");
+        let tmp = std::env::temp_dir().join(format!("wiremd_state_{}", std::process::id()));
         std::fs::write(&tmp, state)
             .map_err(|e| format!("Failed to write temp file: {}", e))?;
 
@@ -131,7 +183,7 @@ impl SyncClient {
             self.yrs_state_path(relative_path)
         );
 
-        let tmp = std::env::temp_dir().join("wiremd_state_pull");
+        let tmp = std::env::temp_dir().join(format!("wiremd_state_pull_{}", std::process::id()));
 
         let output = self.scp_cmd()
             .arg(&remote_path)
@@ -159,7 +211,7 @@ impl SyncClient {
             relative_path
         );
 
-        let tmp = std::env::temp_dir().join("wiremd_file");
+        let tmp = std::env::temp_dir().join(format!("wiremd_file_{}", std::process::id()));
         std::fs::write(&tmp, content)
             .map_err(|e| format!("Failed to write temp file: {}", e))?;
 
@@ -251,6 +303,10 @@ impl SyncClient {
         self.port
     }
 
+    pub fn control_path(&self) -> &str {
+        &self.control_path
+    }
+
     /// Start watching a remote .yrs file for changes via inotifywait.
     /// The background thread detects changes AND pulls the state,
     /// sending the pulled bytes through the channel so the main thread
@@ -272,6 +328,7 @@ impl SyncClient {
                  while true; do inotifywait -e modify,create {} 2>/dev/null; done",
                 yrs_path, yrs_path
             ))
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
@@ -292,8 +349,9 @@ impl SyncClient {
                     break;
                 }
                 // File changed — pull the state in this background thread
-                let tmp = std::env::temp_dir().join("wiremd_watch_pull");
+                let tmp = std::env::temp_dir().join(format!("wiremd_watch_pull_{}", std::process::id()));
                 let output = Command::new("scp")
+                    .stdin(Stdio::null())
                     .arg("-P").arg(port.to_string())
                     .arg("-o").arg("BatchMode=yes")
                     .arg("-o").arg("ConnectTimeout=5")
